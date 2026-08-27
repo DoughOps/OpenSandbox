@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/json"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
@@ -131,6 +132,9 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (resul
 			controllerKey := req.NamespacedName.String()
 			PoolScaleExpectations.DeleteExpectations(controllerKey)
 			r.Allocator.ClearPoolAllocation(ctx, req.Namespace, req.Name)
+			if cleanupErr := r.cleanupTerminatingSandboxesForUnavailablePool(ctx, req.Namespace, req.Name); cleanupErr != nil {
+				return ctrl.Result{}, cleanupErr
+			}
 			log.Info("Pool resource not found, cleaned up scale expectations", "pool", controllerKey)
 			return ctrl.Result{}, nil
 		}
@@ -142,6 +146,9 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (resul
 		controllerKey := controllerutils.GetControllerKey(pool)
 		PoolScaleExpectations.DeleteExpectations(controllerKey)
 		r.Allocator.ClearPoolAllocation(ctx, req.Namespace, req.Name)
+		if cleanupErr := r.cleanupTerminatingSandboxesForUnavailablePool(ctx, req.Namespace, req.Name); cleanupErr != nil {
+			return ctrl.Result{}, cleanupErr
+		}
 		log.Info("Pool resource is being deleted, cleaned up scale expectations", "pool", controllerKey)
 		return ctrl.Result{}, nil
 	}
@@ -183,6 +190,39 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (resul
 	}
 	log.Info("Pool reconcile", "pool", pool.Name, "pods", len(pods), "batchSandboxes", len(batchSandboxes))
 	return r.reconcilePool(ctx, pool, batchSandboxes, pods)
+}
+
+// cleanupTerminatingSandboxesForUnavailablePool releases Pool-owned finalizers
+// when the referenced Pool no longer exists or is itself terminating. At that
+// point there is no Pool lifecycle left to recycle allocations into, and keeping
+// the finalizer would strand deleting BatchSandboxes forever.
+func (r *PoolReconciler) cleanupTerminatingSandboxesForUnavailablePool(ctx context.Context, namespace, poolName string) error {
+	log := logf.FromContext(ctx)
+	batchSandboxList := &sandboxv1alpha1.BatchSandboxList{}
+	if err := r.List(ctx, batchSandboxList, &client.ListOptions{
+		Namespace:     namespace,
+		FieldSelector: fields.SelectorFromSet(fields.Set{fieldindex.IndexNameForPoolRef: poolName}),
+	}); err != nil {
+		return fmt.Errorf("failed to list batch sandboxes for unavailable pool %s/%s: %w", namespace, poolName, err)
+	}
+
+	var errs []error
+	for i := range batchSandboxList.Items {
+		sandbox := &batchSandboxList.Items[i]
+		if sandbox.DeletionTimestamp.IsZero() || !controllerutil.ContainsFinalizer(sandbox, FinalizerPoolAllocation) {
+			continue
+		}
+		if err := utils.UpdateFinalizer(r.Client, sandbox, utils.RemoveFinalizerOpType, FinalizerPoolAllocation); err != nil {
+			if errors.IsNotFound(err) {
+				continue
+			}
+			log.Error(err, "Failed to remove stale pool allocation finalizer", "pool", poolName, "sandbox", sandbox.Name)
+			errs = append(errs, err)
+			continue
+		}
+		log.Info("Removed stale pool allocation finalizer", "pool", poolName, "sandbox", sandbox.Name)
+	}
+	return gerrors.Join(errs...)
 }
 
 // reconcilePool contains the main reconciliation logic
@@ -720,12 +760,77 @@ func (r *PoolReconciler) doRelease(ctx context.Context, pool *sandboxv1alpha1.Po
 		log.Error(syncErr, "Failed to sync released")
 	}
 
-	// 4. Release in-memory allocations for orphan pods directly (no annotation to persist).
+	// 4. A terminating sandbox may already have no unreleased allocations
+	// (including legacy objects whose alloc-status is empty). No recycle result is
+	// produced in that case, so remove only the stale finalizer. Do not call
+	// SyncSandboxReleased again: historical released Pods may already belong to a
+	// different sandbox in the in-memory allocation store.
+	finalizeErr := r.finalizeTerminatingSandboxes(ctx, batchSandboxes)
+	if finalizeErr != nil {
+		log.Error(finalizeErr, "Failed to finalize terminating sandboxes")
+	}
+
+	// 5. Release in-memory allocations for orphan pods directly (no annotation to persist).
 	if len(orphanPods) > 0 {
 		r.Allocator.ReleasePodsAllocation(ctx, pool.Namespace, pool.Name, orphanPods)
 	}
 
-	return toDeletePods, gerrors.Join(err, syncErr)
+	return toDeletePods, gerrors.Join(err, syncErr, finalizeErr)
+}
+
+// finalizeTerminatingSandboxes removes the Pool finalizer once every allocated
+// Pod is already recorded as released. It intentionally does not persist the
+// released annotation or mutate the allocation store: released Pods may have
+// been reassigned to another sandbox by the time this cleanup runs.
+func (r *PoolReconciler) finalizeTerminatingSandboxes(ctx context.Context, batchSandboxes []*sandboxv1alpha1.BatchSandbox) error {
+	log := logf.FromContext(ctx)
+	var errs []error
+	for _, sandbox := range batchSandboxes {
+		if sandbox.DeletionTimestamp.IsZero() ||
+			!controllerutil.ContainsFinalizer(sandbox, FinalizerPoolAllocation) {
+			continue
+		}
+
+		allocated, err := r.Allocator.GetSandboxAllocation(ctx, sandbox)
+		if err != nil {
+			err = fmt.Errorf("failed to get terminating sandbox %s allocation: %w", sandbox.Name, err)
+			log.Error(err, "Cannot finalize terminating sandbox", "sandbox", sandbox.Name)
+			errs = append(errs, err)
+			continue
+		}
+		released, err := r.Allocator.GetSandboxReleased(ctx, sandbox)
+		if err != nil {
+			err = fmt.Errorf("failed to get terminating sandbox %s released state: %w", sandbox.Name, err)
+			log.Error(err, "Cannot finalize terminating sandbox", "sandbox", sandbox.Name)
+			errs = append(errs, err)
+			continue
+		}
+
+		releasedSet := sets.New(released...)
+		allReleased := true
+		for _, podName := range allocated {
+			if !releasedSet.Has(podName) {
+				allReleased = false
+				break
+			}
+		}
+		if !allReleased {
+			continue
+		}
+
+		if err := utils.UpdateFinalizer(r.Client, sandbox, utils.RemoveFinalizerOpType, FinalizerPoolAllocation); err != nil {
+			if errors.IsNotFound(err) {
+				continue
+			}
+			err = fmt.Errorf("failed to remove pool allocation finalizer from sandbox %s: %w", sandbox.Name, err)
+			log.Error(err, "Cannot finalize terminating sandbox", "sandbox", sandbox.Name)
+			errs = append(errs, err)
+			continue
+		}
+		controllerutil.RemoveFinalizer(sandbox, FinalizerPoolAllocation)
+		log.Info("Finalized terminating sandbox with no pending pool allocations", "sandbox", sandbox.Name)
+	}
+	return gerrors.Join(errs...)
 }
 
 // getLatestReleased computes the latest released pods for each sandbox by merging current released with recycle-succeeded pods.
