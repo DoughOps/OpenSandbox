@@ -103,6 +103,7 @@ func init() {
 // PoolReconciler reconciles a Pool object
 type PoolReconciler struct {
 	client.Client
+	APIReader  client.Reader
 	Scheme     *runtime.Scheme
 	Recorder   record.EventRecorder
 	Allocator  Allocator
@@ -128,12 +129,25 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (resul
 	pool := &sandboxv1alpha1.Pool{}
 	if err := r.Get(ctx, req.NamespacedName, pool); err != nil {
 		if errors.IsNotFound(err) {
-			// Pool resource not found, could have been deleted
+			poolUnavailable, checkErr := r.confirmPoolUnavailable(ctx, req.NamespacedName, "")
+			if checkErr != nil {
+				return ctrl.Result{}, checkErr
+			}
+			if !poolUnavailable {
+				log.Info("Pool exists in API server but has not reached the cache yet", "pool", req.NamespacedName.String())
+				return ctrl.Result{RequeueAfter: defaultRetryTime}, nil
+			}
+
+			// Pool resource is confirmed absent from the API server.
 			controllerKey := req.NamespacedName.String()
 			PoolScaleExpectations.DeleteExpectations(controllerKey)
 			r.Allocator.ClearPoolAllocation(ctx, req.Namespace, req.Name)
-			if cleanupErr := r.cleanupTerminatingSandboxesForUnavailablePool(ctx, req.Namespace, req.Name); cleanupErr != nil {
+			poolUnavailable, cleanupErr := r.cleanupTerminatingSandboxesForUnavailablePool(ctx, req.Namespace, req.Name, "")
+			if cleanupErr != nil {
 				return ctrl.Result{}, cleanupErr
+			}
+			if !poolUnavailable {
+				return ctrl.Result{RequeueAfter: defaultRetryTime}, nil
 			}
 			log.Info("Pool resource not found, cleaned up scale expectations", "pool", controllerKey)
 			return ctrl.Result{}, nil
@@ -143,11 +157,24 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (resul
 		return ctrl.Result{}, err
 	}
 	if !pool.DeletionTimestamp.IsZero() {
+		poolUnavailable, checkErr := r.confirmPoolUnavailable(ctx, req.NamespacedName, pool.UID)
+		if checkErr != nil {
+			return ctrl.Result{}, checkErr
+		}
+		if !poolUnavailable {
+			log.Info("Pool was recreated or is no longer terminating", "pool", req.NamespacedName.String())
+			return ctrl.Result{RequeueAfter: defaultRetryTime}, nil
+		}
+
 		controllerKey := controllerutils.GetControllerKey(pool)
 		PoolScaleExpectations.DeleteExpectations(controllerKey)
 		r.Allocator.ClearPoolAllocation(ctx, req.Namespace, req.Name)
-		if cleanupErr := r.cleanupTerminatingSandboxesForUnavailablePool(ctx, req.Namespace, req.Name); cleanupErr != nil {
+		poolUnavailable, cleanupErr := r.cleanupTerminatingSandboxesForUnavailablePool(ctx, req.Namespace, req.Name, pool.UID)
+		if cleanupErr != nil {
 			return ctrl.Result{}, cleanupErr
+		}
+		if !poolUnavailable {
+			return ctrl.Result{RequeueAfter: defaultRetryTime}, nil
 		}
 		log.Info("Pool resource is being deleted, cleaned up scale expectations", "pool", controllerKey)
 		return ctrl.Result{}, nil
@@ -192,18 +219,40 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (resul
 	return r.reconcilePool(ctx, pool, batchSandboxes, pods)
 }
 
+// confirmPoolUnavailable reads directly from the API server so a stale informer
+// cache cannot make an active or recreated Pool look absent. An empty expectedUID
+// only confirms API-level absence; a non-empty UID also accepts that same Pool
+// while it remains terminating.
+func (r *PoolReconciler) confirmPoolUnavailable(ctx context.Context, poolKey client.ObjectKey, expectedUID types.UID) (bool, error) {
+	if r.APIReader == nil {
+		return false, fmt.Errorf("uncached API reader is not configured")
+	}
+
+	latestPool := &sandboxv1alpha1.Pool{}
+	if err := r.APIReader.Get(ctx, poolKey, latestPool); err != nil {
+		if errors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, fmt.Errorf("failed to verify pool %s from API server: %w", poolKey.String(), err)
+	}
+	if expectedUID == "" {
+		return false, nil
+	}
+	return latestPool.UID == expectedUID && !latestPool.DeletionTimestamp.IsZero(), nil
+}
+
 // cleanupTerminatingSandboxesForUnavailablePool releases Pool-owned finalizers
 // when the referenced Pool no longer exists or is itself terminating. At that
 // point there is no Pool lifecycle left to recycle allocations into, and keeping
 // the finalizer would strand deleting BatchSandboxes forever.
-func (r *PoolReconciler) cleanupTerminatingSandboxesForUnavailablePool(ctx context.Context, namespace, poolName string) error {
+func (r *PoolReconciler) cleanupTerminatingSandboxesForUnavailablePool(ctx context.Context, namespace, poolName string, expectedPoolUID types.UID) (bool, error) {
 	log := logf.FromContext(ctx)
 	batchSandboxList := &sandboxv1alpha1.BatchSandboxList{}
 	if err := r.List(ctx, batchSandboxList, &client.ListOptions{
 		Namespace:     namespace,
 		FieldSelector: fields.SelectorFromSet(fields.Set{fieldindex.IndexNameForPoolRef: poolName}),
 	}); err != nil {
-		return fmt.Errorf("failed to list batch sandboxes for unavailable pool %s/%s: %w", namespace, poolName, err)
+		return false, fmt.Errorf("failed to list batch sandboxes for unavailable pool %s/%s: %w", namespace, poolName, err)
 	}
 
 	var errs []error
@@ -212,7 +261,13 @@ func (r *PoolReconciler) cleanupTerminatingSandboxesForUnavailablePool(ctx conte
 		if sandbox.DeletionTimestamp.IsZero() || !controllerutil.ContainsFinalizer(sandbox, FinalizerPoolAllocation) {
 			continue
 		}
-		if err := utils.UpdateFinalizer(r.Client, sandbox, utils.RemoveFinalizerOpType, FinalizerPoolAllocation); err != nil {
+		poolUnavailable, removed, err := r.removePoolAllocationFinalizerIfUnavailable(
+			ctx,
+			client.ObjectKeyFromObject(sandbox),
+			client.ObjectKey{Namespace: namespace, Name: poolName},
+			expectedPoolUID,
+		)
+		if err != nil {
 			if errors.IsNotFound(err) {
 				continue
 			}
@@ -220,9 +275,55 @@ func (r *PoolReconciler) cleanupTerminatingSandboxesForUnavailablePool(ctx conte
 			errs = append(errs, err)
 			continue
 		}
-		log.Info("Removed stale pool allocation finalizer", "pool", poolName, "sandbox", sandbox.Name)
+		if !poolUnavailable {
+			log.Info("Stopped finalizer cleanup because Pool is available", "pool", poolName)
+			return false, gerrors.Join(errs...)
+		}
+		if removed {
+			log.Info("Removed stale pool allocation finalizer", "pool", poolName, "sandbox", sandbox.Name)
+		}
 	}
-	return gerrors.Join(errs...)
+	return true, gerrors.Join(errs...)
+}
+
+func (r *PoolReconciler) removePoolAllocationFinalizerIfUnavailable(
+	ctx context.Context,
+	sandboxKey client.ObjectKey,
+	poolKey client.ObjectKey,
+	expectedPoolUID types.UID,
+) (poolUnavailable bool, removed bool, retErr error) {
+	if r.APIReader == nil {
+		return false, false, fmt.Errorf("uncached API reader is not configured")
+	}
+
+	poolUnavailable = true
+	retErr = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		removed = false
+		latestSandbox := &sandboxv1alpha1.BatchSandbox{}
+		if err := r.APIReader.Get(ctx, sandboxKey, latestSandbox); err != nil {
+			return err
+		}
+		if latestSandbox.Spec.PoolRef != poolKey.Name ||
+			latestSandbox.DeletionTimestamp.IsZero() ||
+			!controllerutil.ContainsFinalizer(latestSandbox, FinalizerPoolAllocation) {
+			return nil
+		}
+
+		var err error
+		poolUnavailable, err = r.confirmPoolUnavailable(ctx, poolKey, expectedPoolUID)
+		if err != nil || !poolUnavailable {
+			return err
+		}
+
+		base := latestSandbox.DeepCopy()
+		controllerutil.RemoveFinalizer(latestSandbox, FinalizerPoolAllocation)
+		if err := r.Patch(ctx, latestSandbox, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
+			return err
+		}
+		removed = true
+		return nil
+	})
+	return poolUnavailable, removed, retErr
 }
 
 // reconcilePool contains the main reconciliation logic
@@ -463,6 +564,10 @@ func (r *PoolReconciler) calculateRevision(pool *sandboxv1alpha1.Pool) (string, 
 // SetupWithManager sets up the controller with the Manager.
 // Todo pod deletion expectations
 func (r *PoolReconciler) SetupWithManager(mgr ctrl.Manager, maxConcurrentReconciles int) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
+
 	filterBatchSandbox := predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
 			bsb, ok := e.Object.(*sandboxv1alpha1.BatchSandbox)

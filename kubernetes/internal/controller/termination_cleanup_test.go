@@ -22,7 +22,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -180,14 +182,18 @@ func TestCleanupTerminatingSandboxesForUnavailablePool(t *testing.T) {
 		WithIndex(&sandboxv1alpha1.BatchSandbox{}, fieldindex.IndexNameForPoolRef, fieldindex.PoolRefIndexFunc).
 		WithObjects(stranded, active, otherPool).
 		Build()
-	r := &PoolReconciler{Client: fakeClient}
+	r := &PoolReconciler{Client: fakeClient, APIReader: fakeClient}
 
-	if err := r.cleanupTerminatingSandboxesForUnavailablePool(context.Background(), "default", "missing-pool"); err != nil {
+	poolUnavailable, err := r.cleanupTerminatingSandboxesForUnavailablePool(context.Background(), "default", "missing-pool", "")
+	if err != nil {
 		t.Fatalf("cleanupTerminatingSandboxesForUnavailablePool() error = %v", err)
+	}
+	if !poolUnavailable {
+		t.Fatal("cleanupTerminatingSandboxesForUnavailablePool() reported the missing Pool as available")
 	}
 
 	updated := &sandboxv1alpha1.BatchSandbox{}
-	err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(stranded), updated)
+	err = fakeClient.Get(context.Background(), client.ObjectKeyFromObject(stranded), updated)
 	if err == nil {
 		if controllerutil.ContainsFinalizer(updated, FinalizerPoolAllocation) {
 			t.Fatal("stale pool finalizer was not removed")
@@ -198,6 +204,116 @@ func TestCleanupTerminatingSandboxesForUnavailablePool(t *testing.T) {
 
 	assertPoolFinalizerPresent(t, fakeClient, active)
 	assertPoolFinalizerPresent(t, fakeClient, otherPool)
+}
+
+func TestPoolReconcileDoesNotCleanUpOnCachedNotFound(t *testing.T) {
+	mockController := gomock.NewController(t)
+	allocator := NewMockAllocator(mockController)
+	scheme := runtime.NewScheme()
+	if err := sandboxv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := metav1.Now()
+	sandbox := terminatingPoolSandbox("terminating", "pool-1", &now)
+	pool := &sandboxv1alpha1.Pool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-1", Namespace: "default", UID: types.UID("new-pool")},
+	}
+	cachedClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sandbox).Build()
+	apiReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).Build()
+	r := &PoolReconciler{Client: cachedClient, APIReader: apiReader, Allocator: allocator}
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(pool)})
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != defaultRetryTime {
+		t.Fatalf("Reconcile() requeueAfter = %v, want %v", result.RequeueAfter, defaultRetryTime)
+	}
+	assertPoolFinalizerPresent(t, cachedClient, sandbox)
+}
+
+func TestPoolReconcileDoesNotCleanUpRecreatedPool(t *testing.T) {
+	mockController := gomock.NewController(t)
+	allocator := NewMockAllocator(mockController)
+	scheme := runtime.NewScheme()
+	if err := sandboxv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := metav1.Now()
+	cachedPool := &sandboxv1alpha1.Pool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "pool-1",
+			Namespace:         "default",
+			UID:               types.UID("old-pool"),
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"test.opensandbox.io/keep"},
+		},
+	}
+	recreatedPool := &sandboxv1alpha1.Pool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-1", Namespace: "default", UID: types.UID("new-pool")},
+	}
+	cachedClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cachedPool).Build()
+	apiReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(recreatedPool).Build()
+	r := &PoolReconciler{Client: cachedClient, APIReader: apiReader, Allocator: allocator}
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(cachedPool)})
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != defaultRetryTime {
+		t.Fatalf("Reconcile() requeueAfter = %v, want %v", result.RequeueAfter, defaultRetryTime)
+	}
+}
+
+func TestPoolReconcileRechecksBeforeRemovingFinalizer(t *testing.T) {
+	mockController := gomock.NewController(t)
+	allocator := NewMockAllocator(mockController)
+	scheme := runtime.NewScheme()
+	if err := sandboxv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	now := metav1.Now()
+	sandbox := terminatingPoolSandbox("terminating", "pool-1", &now)
+	pool := &sandboxv1alpha1.Pool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-1", Namespace: "default", UID: types.UID("new-pool")},
+	}
+	cachedClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithIndex(&sandboxv1alpha1.BatchSandbox{}, fieldindex.IndexNameForPoolRef, fieldindex.PoolRefIndexFunc).
+		WithObjects(sandbox).
+		Build()
+	apiClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool, sandbox.DeepCopy()).Build()
+	apiReader := &poolAppearingReader{Reader: apiClient, poolKey: client.ObjectKeyFromObject(pool)}
+	allocator.EXPECT().ClearPoolAllocation(gomock.Any(), "default", "pool-1").Return(nil)
+	r := &PoolReconciler{Client: cachedClient, APIReader: apiReader, Allocator: allocator}
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(pool)})
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != defaultRetryTime {
+		t.Fatalf("Reconcile() requeueAfter = %v, want %v", result.RequeueAfter, defaultRetryTime)
+	}
+	if apiReader.poolGets < 2 {
+		t.Fatalf("uncached Pool reads = %d, want at least 2", apiReader.poolGets)
+	}
+	assertPoolFinalizerPresent(t, cachedClient, sandbox)
+}
+
+type poolAppearingReader struct {
+	client.Reader
+	poolKey  client.ObjectKey
+	poolGets int
+}
+
+func (r *poolAppearingReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*sandboxv1alpha1.Pool); ok && key == r.poolKey {
+		r.poolGets++
+		if r.poolGets == 1 {
+			return apierrors.NewNotFound(schema.GroupResource{Group: sandboxv1alpha1.GroupVersion.Group, Resource: "pools"}, key.Name)
+		}
+	}
+	return r.Reader.Get(ctx, key, obj, opts...)
 }
 
 func terminatingPoolSandbox(name, poolRef string, deletionTimestamp *metav1.Time) *sandboxv1alpha1.BatchSandbox {
