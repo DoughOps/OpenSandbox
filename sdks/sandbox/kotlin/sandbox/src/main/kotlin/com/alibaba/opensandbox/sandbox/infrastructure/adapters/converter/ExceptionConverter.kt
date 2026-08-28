@@ -81,12 +81,16 @@ fun Throwable.isFileNotFound(): Boolean = this is SandboxApiException && error.c
  * code stays [SandboxError.UNEXPECTED_RESPONSE] and must not be treated as "sandbox missing":
  * it may indicate an endpoint/routing/configuration regression that must remain loud.
  */
-fun Throwable.isSandboxNotFound(): Boolean =
-    this is SandboxApiException &&
-        (
-            error.code == SandboxError.SANDBOX_NOT_FOUND ||
-                error.code.endsWith("::" + SandboxError.SANDBOX_NOT_FOUND)
-            )
+fun Throwable.isSandboxNotFound(): Boolean = this is SandboxApiException && isSandboxNotFoundCode(error.code)
+
+/**
+ * Matches the bare [SandboxError.SANDBOX_NOT_FOUND] code and its runtime-backend-prefixed
+ * variants (`DOCKER::SANDBOX_NOT_FOUND`, `KUBERNETES::SANDBOX_NOT_FOUND`, ...). Shared by the
+ * [isSandboxNotFound] predicate and the [buildSandboxApiException] classifier so the matching
+ * rule cannot drift apart between the two.
+ */
+private fun isSandboxNotFoundCode(code: String): Boolean =
+    code == SandboxError.SANDBOX_NOT_FOUND || code.endsWith("::" + SandboxError.SANDBOX_NOT_FOUND)
 
 private fun buildSandboxApiException(
     message: String?,
@@ -142,9 +146,7 @@ private fun buildSandboxApiException(
         )
     }
 
-    if (sandboxError.code == SandboxError.SANDBOX_NOT_FOUND ||
-        sandboxError.code.endsWith("::" + SandboxError.SANDBOX_NOT_FOUND)
-    ) {
+    if (isSandboxNotFoundCode(sandboxError.code)) {
         return SandboxNotFoundException(
             message = message,
             statusCode = statusCode,

@@ -151,13 +151,17 @@ class SandboxRateLimitException
  * cannot be parsed into such a code stays a plain [SandboxApiException] with
  * [SandboxError.UNEXPECTED_RESPONSE], because it may indicate an endpoint/routing/configuration
  * regression that must remain loud. See [Throwable.isSandboxNotFound].
+ *
+ * Note that [Throwable.isSandboxNotFound] matches the [error] code, so a manually constructed
+ * instance carrying a different [SandboxError.code] does not satisfy the predicate even when
+ * `statusCode` is 404.
  */
 class SandboxNotFoundException
     @JvmOverloads
     constructor(
         message: String? = null,
         cause: Throwable? = null,
-        statusCode: Int? = null,
+        statusCode: Int? = 404,
         error: SandboxError = SandboxError(SandboxError.SANDBOX_NOT_FOUND, message),
         requestId: String? = null,
         responseBody: String? = null,

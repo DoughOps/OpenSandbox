@@ -16,6 +16,7 @@
 
 package com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter
 
+import com.alibaba.opensandbox.sandbox.api.execd.infrastructure.ClientError
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxApiException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxCapacityExceededException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxError
@@ -137,7 +138,7 @@ class SandboxErrorClassificationTest {
 
     @Test
     fun `new exceptions should remain catchable as the existing api exception types`() {
-        val notFound = SandboxNotFoundException("gone", statusCode = 404)
+        val notFound = SandboxNotFoundException("gone")
         val capacity = SandboxCapacityExceededException("full")
 
         assertInstanceOf(SandboxApiException::class.java, notFound)
@@ -145,6 +146,34 @@ class SandboxErrorClassificationTest {
         assertEquals(SandboxError.SANDBOX_NOT_FOUND, notFound.error.code)
         assertEquals(SandboxError.STORAGE_CAPACITY_EXCEEDED, capacity.error.code)
         assertEquals(404, notFound.statusCode)
+        assertEquals(507, capacity.statusCode)
+    }
+
+    @Test
+    fun `execd generated-client errors should be classified through the same choke point`() {
+        val notFound =
+            ClientError<Unit>(
+                message = "execd error",
+                body = """{"code":"DOCKER::SANDBOX_NOT_FOUND","message":"no such sandbox"}""",
+                statusCode = 404,
+                headers = mapOf("X-Request-ID" to listOf("req-1")),
+            ).toSandboxApiException { status, body -> "status=$status body=$body" }
+
+        assertInstanceOf(SandboxNotFoundException::class.java, notFound)
+        assertEquals("DOCKER::SANDBOX_NOT_FOUND", notFound.error.code)
+        assertEquals(404, notFound.statusCode)
+        assertEquals("req-1", notFound.requestId)
+        assertTrue(notFound.isSandboxNotFound())
+
+        val capacity =
+            ClientError<Unit>(
+                message = "execd error",
+                body = """{"code":"QUOTA::WORKSPACE_FULL","message":"workspace is full"}""",
+                statusCode = 507,
+            ).toSandboxApiException { status, body -> "status=$status body=$body" }
+
+        assertInstanceOf(SandboxCapacityExceededException::class.java, capacity)
+        assertEquals("QUOTA::WORKSPACE_FULL", capacity.error.code)
         assertEquals(507, capacity.statusCode)
     }
 }
