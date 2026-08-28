@@ -13,7 +13,9 @@
 # limitations under the License.
 
 from datetime import datetime, timezone
+import json
 import os
+import sqlite3
 
 import psycopg
 import pytest
@@ -203,6 +205,98 @@ def test_migrate_handles_more_than_one_page(tmp_path, postgresql_dsn: str) -> No
     assert result.migrated == 120
     assert result.skipped == 0
     assert len(_records_from_postgresql(postgresql_dsn, limit=200)) == 120
+
+
+def test_migrate_dry_run_does_not_create_postgresql_schema(
+    tmp_path, postgresql_dsn: str
+) -> None:
+    with psycopg.connect(postgresql_dsn) as conn:
+        conn.execute("DROP TABLE IF EXISTS snapshots")
+    sqlite_repo = _create_sqlite_repository(
+        tmp_path,
+        [snapshot_record("snap-dry", "sbx-001", datetime(2026, 1, 2, 3, 4, 5))],
+    )
+    sqlite_repo.close()
+
+    result = migrate_sqlite_snapshots_to_postgresql(
+        tmp_path / "opensandbox.db", postgresql_dsn, dry_run=True
+    )
+
+    assert result.total == 1
+    assert result.migrated == 1
+    assert result.skipped == 0
+    with psycopg.connect(postgresql_dsn) as conn:
+        row = conn.execute("SELECT to_regclass('snapshots')").fetchone()
+    assert row is None or row[0] is None
+
+
+def test_migrate_reads_old_sqlite_schema_without_modifying_it(
+    tmp_path, postgresql_dsn: str
+) -> None:
+    _truncate_postgresql(postgresql_dsn)
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE snapshots (
+            id TEXT PRIMARY KEY,
+            source_sandbox_id TEXT NOT NULL,
+            name TEXT,
+            description TEXT,
+            restore_config TEXT NOT NULL,
+            state TEXT NOT NULL,
+            reason TEXT,
+            message TEXT,
+            last_transition_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO snapshots (
+            id, source_sandbox_id, name, description, restore_config, state,
+            reason, message, last_transition_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "snap-legacy",
+            "sbx-legacy",
+            "name-snap-legacy",
+            "description-snap-legacy",
+            json.dumps({"image": "registry.example.com/snapshots/snap-legacy:latest"}),
+            "Ready",
+            "reason-snap-legacy",
+            "message-snap-legacy",
+            "2026-01-02T03:04:05",
+            "2026-01-02T03:04:05",
+            "2026-01-02T03:04:05",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    result = migrate_sqlite_snapshots_to_postgresql(db_path, postgresql_dsn)
+
+    assert result.total == 1
+    assert result.migrated == 1
+    conn = sqlite3.connect(db_path)
+    try:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(snapshots)").fetchall()
+        }
+    finally:
+        conn.close()
+    assert "namespace" not in columns
+    stored = _records_from_postgresql(postgresql_dsn)
+    assert len(stored) == 1
+    legacy = stored[0]
+    assert legacy.id == "snap-legacy"
+    assert legacy.namespace is None
+    assert legacy.status.state == SnapshotState.READY
+    assert legacy.restore_config.image == "registry.example.com/snapshots/snap-legacy:latest"
 
 
 def test_migrate_requires_existing_sqlite_file(tmp_path) -> None:

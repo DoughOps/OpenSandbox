@@ -55,8 +55,12 @@ Snapshots migrated: total=42, migrated=42, skipped=0
 
 - Records whose id already exists in PostgreSQL are skipped, so the command can be re-run
   safely. A repeated run reports `migrated=0` and `skipped=42`.
-- `--dry-run` reports the counts without writing anything.
-- The PostgreSQL schema is created if it does not exist.
+- `--dry-run` reports the counts without writing anything, including without creating the
+  PostgreSQL `snapshots` table, so it works with read-only target credentials.
+- The source SQLite database is opened read-only and is never modified, so a backup on a
+  read-only mount can be migrated.
+- The PostgreSQL schema is created only on a real migration run, when the table does not
+  already exist.
 - Timestamps stored as naive UTC in SQLite are written as `TIMESTAMPTZ` in UTC.
 
 ## Switch the server
