@@ -21,11 +21,13 @@ import com.alibaba.opensandbox.sandbox.api.infrastructure.ClientException
 import com.alibaba.opensandbox.sandbox.api.infrastructure.ServerError
 import com.alibaba.opensandbox.sandbox.api.infrastructure.ServerException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxApiException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxCapacityExceededException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxConnectionException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxError
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxError.Companion.UNEXPECTED_RESPONSE
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxInternalException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxNotFoundException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxRateLimitException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxTimeoutException
 import com.alibaba.opensandbox.sandbox.transport.RetryDeadlineExceededException
@@ -69,6 +71,23 @@ import com.alibaba.opensandbox.sandbox.api.execd.infrastructure.ServerException 
  */
 fun Throwable.isFileNotFound(): Boolean = this is SandboxApiException && error.code == SandboxError.FILE_NOT_FOUND
 
+/**
+ * Returns `true` when this throwable represents the target sandbox instance not existing on the
+ * runtime backend, rather than a genuine failure.
+ *
+ * Detection matches the explicit [SandboxError.SANDBOX_NOT_FOUND] code and the
+ * runtime-backend-prefixed variants deployed backends emit today (`DOCKER::SANDBOX_NOT_FOUND`,
+ * `KUBERNETES::SANDBOX_NOT_FOUND`, ...). A bare HTTP 404 whose body cannot be parsed into such a
+ * code stays [SandboxError.UNEXPECTED_RESPONSE] and must not be treated as "sandbox missing":
+ * it may indicate an endpoint/routing/configuration regression that must remain loud.
+ */
+fun Throwable.isSandboxNotFound(): Boolean =
+    this is SandboxApiException &&
+        (
+            error.code == SandboxError.SANDBOX_NOT_FOUND ||
+                error.code.endsWith("::" + SandboxError.SANDBOX_NOT_FOUND)
+            )
+
 private fun buildSandboxApiException(
     message: String?,
     statusCode: Int,
@@ -94,6 +113,39 @@ private fun buildSandboxApiException(
             error = sandboxError,
             requestId = requestId,
             retryAfter = retryAfter,
+            responseBody = responseBody,
+            isRetryable = isRetryable,
+        )
+    }
+
+    if (statusCode == 507) {
+        return SandboxCapacityExceededException(
+            message = message,
+            statusCode = statusCode,
+            cause = cause,
+            // Preserve a structured server code when present; only fall back to the
+            // storage-capacity constant when the body carries no parseable code.
+            error =
+                if (sandboxError.code == UNEXPECTED_RESPONSE) {
+                    SandboxError(SandboxError.STORAGE_CAPACITY_EXCEEDED, message)
+                } else {
+                    sandboxError
+                },
+            requestId = requestId,
+            responseBody = responseBody,
+            isRetryable = isRetryable,
+        )
+    }
+
+    if (sandboxError.code == SandboxError.SANDBOX_NOT_FOUND ||
+        sandboxError.code.endsWith("::" + SandboxError.SANDBOX_NOT_FOUND)
+    ) {
+        return SandboxNotFoundException(
+            message = message,
+            statusCode = statusCode,
+            cause = cause,
+            error = sandboxError,
+            requestId = requestId,
             responseBody = responseBody,
             isRetryable = isRetryable,
         )
