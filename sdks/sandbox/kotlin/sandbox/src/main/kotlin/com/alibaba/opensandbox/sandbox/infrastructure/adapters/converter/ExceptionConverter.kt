@@ -124,10 +124,15 @@ private fun buildSandboxApiException(
             statusCode = statusCode,
             cause = cause,
             // Preserve a structured server code when present; only fall back to the
-            // storage-capacity constant when the body carries no parseable code.
+            // storage-capacity constant when the body carries no parseable code. When the
+            // body is present but unparseable, sandboxError.message holds the raw payload
+            // and must not be replaced by the generic HTTP message.
             error =
                 if (sandboxError.code == UNEXPECTED_RESPONSE) {
-                    SandboxError(SandboxError.STORAGE_CAPACITY_EXCEEDED, message)
+                    SandboxError(
+                        SandboxError.STORAGE_CAPACITY_EXCEEDED,
+                        sandboxError.message ?: message,
+                    )
                 } else {
                     sandboxError
                 },

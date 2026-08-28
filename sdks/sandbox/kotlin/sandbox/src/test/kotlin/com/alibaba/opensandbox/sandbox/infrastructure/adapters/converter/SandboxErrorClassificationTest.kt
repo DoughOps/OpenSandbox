@@ -55,6 +55,18 @@ class SandboxErrorClassificationTest {
         assertInstanceOf(SandboxCapacityExceededException::class.java, ex)
         assertEquals(SandboxError.STORAGE_CAPACITY_EXCEEDED, ex.error.code)
         assertEquals(507, ex.statusCode)
+        assertEquals("status=507 body=null", ex.error.message)
+    }
+
+    @Test
+    fun `507 response with an unparseable body should keep the raw payload as the error message`() {
+        val ex =
+            errorResponse(507, "not a structured error body")
+                .toSandboxApiException { status, body -> "status=$status body=$body" }
+
+        assertInstanceOf(SandboxCapacityExceededException::class.java, ex)
+        assertEquals(SandboxError.STORAGE_CAPACITY_EXCEEDED, ex.error.code)
+        assertEquals("not a structured error body", ex.error.message)
     }
 
     @Test
