@@ -392,7 +392,10 @@ async def _proxy_http_request(
     except httpx.ConnectError as e:
         raise HTTPException(
             status_code=502,
-            detail=f"Could not connect to the backend sandbox {endpoint}: {e}",
+            detail={
+                "code": "BACKEND_CONNECTION_FAILED",
+                "message": f"Could not connect to the backend sandbox {endpoint}: {e}",
+            },
         ) from e
     except HTTPException:
         raise

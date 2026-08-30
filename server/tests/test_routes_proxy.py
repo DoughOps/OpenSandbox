@@ -1090,7 +1090,9 @@ def test_proxy_maps_connect_error_to_502(
     )
 
     assert response.status_code == 502
-    assert "Could not connect to the backend sandbox" in response.json()["message"]
+    payload = response.json()
+    assert payload["code"] == "BACKEND_CONNECTION_FAILED"
+    assert "Could not connect to the backend sandbox" in payload["message"]
 
 
 def test_proxy_maps_unexpected_error_to_500(
