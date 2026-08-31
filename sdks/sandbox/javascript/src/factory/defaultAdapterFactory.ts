@@ -34,6 +34,34 @@ import type {
   LifecycleStack,
 } from "./adapterFactory.js";
 
+const API_KEY_HEADER = "OPEN-SANDBOX-API-KEY";
+
+function createDataPlaneHeaders(
+  connectionHeaders: Record<string, string>,
+  endpointHeaders: Record<string, string> | undefined,
+  useServerProxy: boolean,
+  apiKey: string | undefined,
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    ...connectionHeaders,
+    ...(endpointHeaders ?? {}),
+  };
+
+  if (!useServerProxy || apiKey) {
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase() === API_KEY_HEADER.toLowerCase()) {
+        delete headers[key];
+      }
+    }
+  }
+
+  if (useServerProxy && apiKey) {
+    headers[API_KEY_HEADER] = apiKey;
+  }
+
+  return headers;
+}
+
 export class DefaultAdapterFactory implements AdapterFactory {
   createLifecycleStack(opts: CreateLifecycleStackOptions): LifecycleStack {
     const lifecycleClient = createLifecycleClient({
@@ -51,10 +79,12 @@ export class DefaultAdapterFactory implements AdapterFactory {
   }
 
   createExecdStack(opts: CreateExecdStackOptions): ExecdStack {
-    const headers: Record<string, string> = {
-      ...(opts.connectionConfig.headers ?? {}),
-      ...(opts.endpointHeaders ?? {}),
-    };
+    const headers = createDataPlaneHeaders(
+      opts.connectionConfig.headers,
+      opts.endpointHeaders,
+      opts.connectionConfig.useServerProxy,
+      opts.connectionConfig.apiKey,
+    );
     const execdClient = createExecdClient({
       baseUrl: opts.execdBaseUrl,
       headers,
@@ -91,10 +121,12 @@ export class DefaultAdapterFactory implements AdapterFactory {
   }
 
   createEgressStack(opts: CreateEgressStackOptions): EgressStack {
-    const headers: Record<string, string> = {
-      ...(opts.connectionConfig.headers ?? {}),
-      ...(opts.endpointHeaders ?? {}),
-    };
+    const headers = createDataPlaneHeaders(
+      opts.connectionConfig.headers,
+      opts.endpointHeaders,
+      opts.connectionConfig.useServerProxy,
+      opts.connectionConfig.apiKey,
+    );
     const egressClient = createEgressClient({
       baseUrl: opts.egressBaseUrl,
       headers,
