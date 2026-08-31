@@ -389,10 +389,13 @@ async def _proxy_http_request(
             # after client.send() must release the acquired pool connection.
             await _close_backend_response(resp)
             raise
-    except httpx.ConnectError as e:
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
         raise HTTPException(
             status_code=502,
-            detail=f"Could not connect to the backend sandbox {endpoint}: {e}",
+            detail={
+                "code": "BACKEND_CONNECTION_FAILED",
+                "message": f"Could not connect to the backend sandbox {endpoint}: {e}",
+            },
         ) from e
     except HTTPException:
         raise
