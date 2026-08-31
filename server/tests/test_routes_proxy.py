@@ -81,7 +81,7 @@ class _FakeAsyncClient:
     def __init__(self):
         self.built = None
         self.response = _FakeStreamingResponse()
-        self.raise_connect_error = False
+        self.connection_error: httpx.RequestError | None = None
         self.raise_generic_error = False
 
     def build_request(
@@ -102,8 +102,8 @@ class _FakeAsyncClient:
         return self.built
 
     async def send(self, req, stream: bool = True):
-        if self.raise_connect_error:
-            raise httpx.ConnectError("connection refused")
+        if self.connection_error:
+            raise self.connection_error
         if self.raise_generic_error:
             raise RuntimeError("unexpected proxy error")
         return self.response
@@ -1069,10 +1069,15 @@ def test_proxy_websocket_relays_messages_and_forwards_safe_headers(
     assert lowered_headers["x-trace"] == "trace-ws"
 
 
-def test_proxy_maps_connect_error_to_502(
+@pytest.mark.parametrize(
+    "connection_error",
+    [httpx.ConnectError("connection refused"), httpx.ConnectTimeout("connection timed out")],
+)
+def test_proxy_maps_connect_failure_to_502(
     client: TestClient,
     auth_headers: dict,
     monkeypatch,
+    connection_error: httpx.RequestError,
 ) -> None:
     class StubService:
         @staticmethod
@@ -1081,7 +1086,7 @@ def test_proxy_maps_connect_error_to_502(
 
     monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
     fake_client = _FakeAsyncClient()
-    fake_client.raise_connect_error = True
+    fake_client.connection_error = connection_error
     _set_http_client(client, fake_client)
 
     response = client.get(
@@ -1090,7 +1095,9 @@ def test_proxy_maps_connect_error_to_502(
     )
 
     assert response.status_code == 502
-    assert "Could not connect to the backend sandbox" in response.json()["message"]
+    payload = response.json()
+    assert payload["code"] == "BACKEND_CONNECTION_FAILED"
+    assert "Could not connect to the backend sandbox" in payload["message"]
 
 
 def test_proxy_maps_unexpected_error_to_500(
