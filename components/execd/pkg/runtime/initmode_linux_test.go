@@ -17,6 +17,7 @@
 package runtime
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -183,7 +184,6 @@ func TestReaperReapsOrphan(t *testing.T) {
 func TestReaperSweepBackstop(t *testing.T) {
 	oldInterval := reaperSweepInterval
 	reaperSweepInterval = 50 * time.Millisecond
-	defer func() { reaperSweepInterval = oldInterval }()
 
 	r := newReaper()
 	r.start()
@@ -197,6 +197,7 @@ func TestReaperSweepBackstop(t *testing.T) {
 		initReaper.stop()
 		signal.Stop(subscribed)
 		initReaper = nil
+		reaperSweepInterval = oldInterval
 	})
 	go r.run()
 
@@ -361,5 +362,21 @@ func TestManagedProcessWithoutReaperUsesCmdWait(t *testing.T) {
 	}
 	if mp.ExitCode() != 4 {
 		t.Fatalf("ExitCode = %d, want 4", mp.ExitCode())
+	}
+}
+
+func TestRunManagedCommandWithReaper(t *testing.T) {
+	startReaperForTest(t)
+	cmd := exec.Command("sh", "-c", "exit 17")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	exitCode, err := RunManagedCommand(context.Background(), cmd, func() {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	})
+	if err == nil {
+		t.Fatal("RunManagedCommand error = nil, want exit status 17")
+	}
+	if exitCode != 17 {
+		t.Fatalf("RunManagedCommand exit code = %d, want 17", exitCode)
 	}
 }

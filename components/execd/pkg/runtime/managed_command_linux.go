@@ -1,3 +1,5 @@
+//go:build linux
+
 // Copyright 2026 Alibaba Group Holding Ltd.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,28 +14,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package sink
+package runtime
 
-import (
-	"bytes"
-	"time"
+import "os/exec"
 
-	"github.com/alibaba/opensandbox/nodeagent/pkg/api"
-)
-
-func SameResourceIdentity(left, right api.Resource) bool {
-	return left == right
-}
-
-func EncodeBatch(batch api.Batch) []byte {
-	var out bytes.Buffer
-	for _, item := range batch.Items {
-		out.WriteString(item.Record.Timestamp.UTC().Format(time.RFC3339Nano))
-		out.WriteByte(' ')
-		out.WriteString(item.Record.Attributes["stream"])
-		out.WriteByte(' ')
-		out.Write(item.Record.Body)
-		out.WriteByte('\n')
-	}
-	return out.Bytes()
+func startManagedCommand(cmd *exec.Cmd) (managedCommand, error) {
+	return launchManaged(cmd)
 }

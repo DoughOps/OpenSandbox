@@ -23,12 +23,16 @@ import com.alibaba.opensandbox.sandbox.domain.pool.PooledSandboxCreator
 import com.alibaba.opensandbox.sandbox.domain.pool.SandboxPreparer
 import com.alibaba.opensandbox.sandbox.infrastructure.pool.InMemoryPoolStateStore
 import com.alibaba.opensandbox.sandbox.internal.PoolTracer
+import com.alibaba.opensandbox.sandbox.transport.RetryPolicy
 import io.mockk.every
 import io.mockk.mockk
 import io.opentelemetry.api.GlobalOpenTelemetry
+import io.opentelemetry.api.OpenTelemetry
 import io.opentelemetry.api.common.AttributeKey
+import io.opentelemetry.api.trace.StatusCode
 import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator
 import io.opentelemetry.context.propagation.ContextPropagators
+import io.opentelemetry.context.propagation.TextMapPropagator
 import io.opentelemetry.sdk.OpenTelemetrySdk
 import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter
 import io.opentelemetry.sdk.trace.SdkTracerProvider
@@ -45,6 +49,7 @@ import org.junit.jupiter.api.Test
 import org.slf4j.MDC
 import java.time.Duration
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 class PoolWarmupTracingTest {
@@ -92,7 +97,12 @@ class PoolWarmupTracingTest {
                 .maxIdle(1)
                 .warmupConcurrency(1)
                 .stateStore(store)
-                .connectionConfig(ConnectionConfig.builder().enableTracing().build())
+                .connectionConfig(
+                    ConnectionConfig.builder()
+                        .enableTracing()
+                        .retryPolicy(RetryPolicy.disabled())
+                        .build(),
+                )
                 .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
                 .sandboxCreator(
                     PooledSandboxCreator {
@@ -100,13 +110,14 @@ class PoolWarmupTracingTest {
                             every { sandbox.id } returns "warmup-trace-1"
                         }
                     },
-                ).warmupSkipHealthCheck()
+                ).warmupHealthCheck { true }
                 .warmupSandboxPreparer(
                     SandboxPreparer {
                         capturedTraceId.set(MDC.get(PoolTracer.MDC_TRACE_ID))
                         capturedSpanId.set(MDC.get(PoolTracer.MDC_SPAN_ID))
                     },
-                ).reconcileInterval(Duration.ofSeconds(30))
+                )
+                .warmupPostPrepareHealthCheck { true }
                 .drainTimeout(Duration.ofSeconds(2))
                 .build()
 
@@ -118,9 +129,11 @@ class PoolWarmupTracingTest {
             assertEquals("trace-pool", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_POOL_NAME)])
             assertEquals("trace-owner", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_POOL_OWNER)])
             assertEquals(1L, root.attributes[AttributeKey.longKey(PoolTracer.ATTR_POOL_RUN_GENERATION)])
+            assertEquals(1L, root.attributes[AttributeKey.longKey(PoolTracer.ATTR_POOL_LEADER_EPOCH)])
             assertEquals("warmup-trace-1", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_SANDBOX_ID)])
             assertEquals("ubuntu:22.04", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_SANDBOX_IMAGE)])
             assertEquals("success", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_RESULT)])
+            assertEquals("commit", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_STAGE)])
 
             // MDC must expose the same trace while warmup code runs.
             assertEquals(root.traceId, capturedTraceId.get())
@@ -128,7 +141,9 @@ class PoolWarmupTracingTest {
 
             val names = spans.map { it.name }.toSet()
             assertTrue(names.contains(PoolTracer.WARMUP_CREATE_SPAN))
+            assertTrue(names.contains(PoolTracer.WARMUP_READINESS_CHECK_SPAN))
             assertTrue(names.contains(PoolTracer.WARMUP_PREPARE_SPAN))
+            assertTrue(names.contains(PoolTracer.WARMUP_POST_PREPARE_CHECK_SPAN))
             assertTrue(names.contains(PoolTracer.WARMUP_RENEW_SPAN))
             assertTrue(names.contains(PoolTracer.WARMUP_COMMIT_SPAN))
 
@@ -139,13 +154,19 @@ class PoolWarmupTracingTest {
                 assertEquals(root.traceId, span.traceId, "all spans must share the warmup trace id")
             }
             val create = spans.single { it.name == PoolTracer.WARMUP_CREATE_SPAN }
+            val readiness = spans.single { it.name == PoolTracer.WARMUP_READINESS_CHECK_SPAN }
             val prepare = spans.single { it.name == PoolTracer.WARMUP_PREPARE_SPAN }
+            val postPrepare = spans.single { it.name == PoolTracer.WARMUP_POST_PREPARE_CHECK_SPAN }
             val renew = spans.single { it.name == PoolTracer.WARMUP_RENEW_SPAN }
             val commit = spans.single { it.name == PoolTracer.WARMUP_COMMIT_SPAN }
             assertEquals(root.spanId, create.parentSpanId)
+            assertEquals(root.spanId, readiness.parentSpanId)
             assertEquals(root.spanId, prepare.parentSpanId)
+            assertEquals(root.spanId, postPrepare.parentSpanId)
             assertEquals(root.spanId, renew.parentSpanId)
             assertEquals(root.spanId, commit.parentSpanId)
+            assertEquals(1L, readiness.attributes[AttributeKey.longKey(PoolTracer.ATTR_HEALTH_ATTEMPT_COUNT)])
+            assertEquals(1L, postPrepare.attributes[AttributeKey.longKey(PoolTracer.ATTR_HEALTH_ATTEMPT_COUNT)])
 
             // Root span is backdated to submission, so the trace covers the
             // queue wait before the create phase.
@@ -177,28 +198,39 @@ class PoolWarmupTracingTest {
                 .maxIdle(1)
                 .warmupConcurrency(1)
                 .stateStore(store)
-                .connectionConfig(ConnectionConfig.builder().enableTracing().build())
+                .connectionConfig(
+                    ConnectionConfig.builder()
+                        .enableTracing()
+                        .retryPolicy(RetryPolicy.disabled())
+                        .build(),
+                )
                 .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
                 .sandboxCreator(
                     PooledSandboxCreator {
                         throw RuntimeException("create boom")
                     },
                 ).warmupSkipHealthCheck()
-                .reconcileInterval(Duration.ofSeconds(30))
                 .drainTimeout(Duration.ofMillis(200))
                 .build()
 
         pool.start()
         try {
             awaitCondition { pool.snapshot().failureCount >= 1 }
+            awaitCondition { spanExporter.finishedSpanItems.any { it.name == PoolTracer.WARMUP_ROOT_SPAN } }
             val spans = spanExporter.finishedSpanItems
             val root = spans.single { it.name == PoolTracer.WARMUP_ROOT_SPAN }
             assertEquals("failure", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_RESULT)])
+            assertEquals("create", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_STAGE)])
+            assertEquals("create_failed", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_REASON)])
+            assertEquals(StatusCode.ERROR, root.status.statusCode)
             assertEquals(
-                1,
+                0,
                 root.events.count { it.name == "exception" },
-                "failure must be recorded on the root span",
+                "root must not duplicate a phase exception",
             )
+            val create = spans.single { it.name == PoolTracer.WARMUP_CREATE_SPAN }
+            assertEquals(StatusCode.ERROR, create.status.statusCode)
+            assertEquals(1, create.events.count { it.name == "exception" })
             assertTrue(spans.none { it.name == PoolTracer.WARMUP_COMMIT_SPAN })
         } finally {
             pool.shutdown(graceful = false)
@@ -206,7 +238,7 @@ class PoolWarmupTracingTest {
     }
 
     @Test
-    fun `dropped warmup commit is traced as a failure`() {
+    fun `dropped warmup commit has a distinct terminal result and reason`() {
         val spanExporter = installSdkTracerProvider()
         val store = LockLossOnCommitPoolStateStore()
         val pool =
@@ -216,7 +248,12 @@ class PoolWarmupTracingTest {
                 .maxIdle(1)
                 .warmupConcurrency(1)
                 .stateStore(store)
-                .connectionConfig(ConnectionConfig.builder().enableTracing().build())
+                .connectionConfig(
+                    ConnectionConfig.builder()
+                        .enableTracing()
+                        .retryPolicy(RetryPolicy.disabled())
+                        .build(),
+                )
                 .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
                 .sandboxCreator(
                     PooledSandboxCreator {
@@ -229,7 +266,7 @@ class PoolWarmupTracingTest {
                     SandboxPreparer {
                         store.failRenewPrimaryLock = true
                     },
-                ).reconcileInterval(Duration.ofSeconds(30))
+                )
                 .drainTimeout(Duration.ofSeconds(2))
                 .build()
 
@@ -238,15 +275,138 @@ class PoolWarmupTracingTest {
             awaitCondition { spanExporter.finishedSpanItems.any { it.name == PoolTracer.WARMUP_ROOT_SPAN } }
             val spans = spanExporter.finishedSpanItems
             val root = spans.single { it.name == PoolTracer.WARMUP_ROOT_SPAN }
-            assertEquals("failure", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_RESULT)])
+            assertEquals("dropped", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_RESULT)])
+            assertEquals("commit", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_STAGE)])
             assertEquals(
-                "warmup-lock-lost",
-                root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_DROP_REASON)],
+                "primary_lock_lost",
+                root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_REASON)],
             )
-            assertNull(root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_SANDBOX_ID)])
+            assertEquals("warmup-dropped-1", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_SANDBOX_ID)])
+            assertEquals(StatusCode.ERROR, root.status.statusCode)
+            val commit = spans.single { it.name == PoolTracer.WARMUP_COMMIT_SPAN }
+            assertEquals(
+                "dropped",
+                commit.attributes[AttributeKey.stringKey(PoolTracer.ATTR_RESULT)],
+            )
+            assertEquals(
+                "primary_lock_lost",
+                commit.attributes[AttributeKey.stringKey(PoolTracer.ATTR_REASON)],
+            )
+            assertEquals(StatusCode.ERROR, commit.status.statusCode)
+        } finally {
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `health polling retries are summarized in one stage span`() {
+        val spanExporter = installSdkTracerProvider()
+        val attempts = AtomicInteger(0)
+        val store = InMemoryPoolStateStore()
+        val pool =
+            SandboxPool.builder()
+                .poolName("trace-retry-pool")
+                .ownerId("trace-retry-owner")
+                .maxIdle(1)
+                .warmupConcurrency(1)
+                .stateStore(store)
+                .connectionConfig(ConnectionConfig.builder().enableTracing().build())
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .sandboxCreator(
+                    PooledSandboxCreator {
+                        mockk<Sandbox>(relaxed = true).also { sandbox ->
+                            every { sandbox.id } returns "warmup-retry-1"
+                        }
+                    },
+                ).warmupHealthCheck { attempts.incrementAndGet() >= 3 }
+                .warmupHealthCheckInitialDelay(Duration.ofMillis(10))
+                .warmupHealthCheckPollingInterval(Duration.ofMillis(10))
+                .warmupReadyTimeout(Duration.ofSeconds(1))
+                .drainTimeout(Duration.ofSeconds(2))
+                .build()
+
+        pool.start()
+        try {
+            awaitCondition { store.snapshotCounters("trace-retry-pool").idleCount == 1 }
+            val readiness =
+                spanExporter.finishedSpanItems.single {
+                    it.name == PoolTracer.WARMUP_READINESS_CHECK_SPAN
+                }
+            assertEquals(3, attempts.get())
+            assertEquals(3L, readiness.attributes[AttributeKey.longKey(PoolTracer.ATTR_HEALTH_ATTEMPT_COUNT)])
+            assertEquals(2L, readiness.attributes[AttributeKey.longKey(PoolTracer.ATTR_HEALTH_FALSE_COUNT)])
+            assertEquals(0L, readiness.attributes[AttributeKey.longKey(PoolTracer.ATTR_HEALTH_EXCEPTION_COUNT)])
+            assertEquals("success", readiness.attributes[AttributeKey.stringKey(PoolTracer.ATTR_RESULT)])
             assertTrue(
-                spans.any { it.name == PoolTracer.WARMUP_COMMIT_SPAN },
-                "commit phase must still be traced",
+                spanExporter.finishedSpanItems.count {
+                    it.name == PoolTracer.WARMUP_READINESS_CHECK_SPAN
+                } == 1,
+            )
+        } finally {
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `health summary distinguishes false results from callback exceptions`() {
+        val spanExporter = installSdkTracerProvider()
+        val attempts = AtomicInteger(0)
+        val pool =
+            SandboxPool.builder()
+                .poolName("trace-health-failure-pool")
+                .ownerId("trace-health-failure-owner")
+                .maxIdle(1)
+                .warmupConcurrency(1)
+                .stateStore(InMemoryPoolStateStore())
+                .connectionConfig(
+                    ConnectionConfig.builder()
+                        .enableTracing()
+                        .retryPolicy(RetryPolicy.disabled())
+                        .build(),
+                )
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .sandboxCreator(
+                    PooledSandboxCreator {
+                        mockk<Sandbox>(relaxed = true).also { sandbox ->
+                            every { sandbox.id } returns "warmup-health-failure-${attempts.get()}"
+                        }
+                    },
+                ).warmupHealthCheck {
+                    if (attempts.incrementAndGet() == 1) throw IllegalStateException("probe boom")
+                    false
+                }.warmupHealthCheckInitialDelay(Duration.ZERO)
+                .warmupHealthCheckPollingInterval(Duration.ofMillis(10))
+                .warmupReadyTimeout(Duration.ofMillis(40))
+                .drainTimeout(Duration.ofSeconds(1))
+                .build()
+
+        pool.start()
+        try {
+            awaitCondition {
+                spanExporter.finishedSpanItems.any {
+                    it.name == PoolTracer.WARMUP_ROOT_SPAN &&
+                        it.attributes[AttributeKey.stringKey(PoolTracer.ATTR_REASON)] == "readiness_timeout"
+                }
+            }
+            val root =
+                spanExporter.finishedSpanItems.first {
+                    it.name == PoolTracer.WARMUP_ROOT_SPAN &&
+                        it.attributes[AttributeKey.stringKey(PoolTracer.ATTR_REASON)] == "readiness_timeout"
+                }
+            val readiness =
+                spanExporter.finishedSpanItems.first {
+                    it.name == PoolTracer.WARMUP_READINESS_CHECK_SPAN &&
+                        it.traceId == root.traceId
+                }
+            assertTrue(readiness.attributes[AttributeKey.longKey(PoolTracer.ATTR_HEALTH_FALSE_COUNT)]!! >= 1L)
+            assertEquals(1L, readiness.attributes[AttributeKey.longKey(PoolTracer.ATTR_HEALTH_EXCEPTION_COUNT)])
+            assertEquals(
+                "callback",
+                readiness.attributes[AttributeKey.stringKey(PoolTracer.ATTR_ERROR_CATEGORY)],
+            )
+            assertEquals(
+                "timeout",
+                root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_ERROR_CATEGORY)],
             )
         } finally {
             pool.shutdown(graceful = false)
@@ -273,7 +433,6 @@ class PoolWarmupTracingTest {
                         }
                     },
                 ).warmupSkipHealthCheck()
-                .reconcileInterval(Duration.ofSeconds(30))
                 .drainTimeout(Duration.ofSeconds(2))
                 .build()
 
@@ -284,6 +443,85 @@ class PoolWarmupTracingTest {
                 spanExporter.finishedSpanItems.isEmpty(),
                 "no spans may be emitted when enableTracing is false",
             )
+        } finally {
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `broken telemetry provider cannot prevent warmup completion`() {
+        val brokenTelemetry = mockk<OpenTelemetry>()
+        every { brokenTelemetry.tracerBuilder(any()) } throws IllegalStateException("otel boom")
+        GlobalOpenTelemetry.set(brokenTelemetry)
+        val store = InMemoryPoolStateStore()
+        val pool =
+            SandboxPool.builder()
+                .poolName("broken-otel-pool")
+                .ownerId("broken-otel-owner")
+                .maxIdle(1)
+                .warmupConcurrency(1)
+                .stateStore(store)
+                .connectionConfig(ConnectionConfig.builder().enableTracing().build())
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .sandboxCreator(
+                    PooledSandboxCreator {
+                        mockk<Sandbox>(relaxed = true).also { sandbox ->
+                            every { sandbox.id } returns "broken-otel-warmup-1"
+                        }
+                    },
+                ).warmupSkipHealthCheck()
+                .drainTimeout(Duration.ofSeconds(1))
+                .build()
+
+        pool.start()
+        try {
+            awaitCondition {
+                store.snapshotCounters("broken-otel-pool").idleCount == 1 &&
+                    pool.snapshot().inFlightOperations == 0
+            }
+        } finally {
+            pool.shutdown(graceful = false)
+        }
+    }
+
+    @Test
+    fun `forced shutdown reports delayed warmup as run retired`() {
+        val spanExporter = installSdkTracerProvider()
+        val created = AtomicInteger(0)
+        val pool =
+            SandboxPool.builder()
+                .poolName("trace-retired-pool")
+                .ownerId("trace-retired-owner")
+                .maxIdle(1)
+                .warmupConcurrency(1)
+                .stateStore(InMemoryPoolStateStore())
+                .connectionConfig(
+                    ConnectionConfig.builder()
+                        .enableTracing()
+                        .retryPolicy(RetryPolicy.disabled())
+                        .build(),
+                )
+                .creationSpec(PoolCreationSpec.builder().image("ubuntu:22.04").build())
+                .sandboxCreator(
+                    PooledSandboxCreator {
+                        created.incrementAndGet()
+                        mockk<Sandbox>(relaxed = true).also { sandbox ->
+                            every { sandbox.id } returns "retired-warmup-1"
+                        }
+                    },
+                ).warmupHealthCheck { true }
+                .warmupHealthCheckInitialDelay(Duration.ofSeconds(30))
+                .drainTimeout(Duration.ofMillis(100))
+                .build()
+
+        pool.start()
+        try {
+            awaitCondition { created.get() == 1 }
+            pool.shutdown(graceful = false)
+            awaitCondition { spanExporter.finishedSpanItems.any { it.name == PoolTracer.WARMUP_ROOT_SPAN } }
+            val root = spanExporter.finishedSpanItems.single { it.name == PoolTracer.WARMUP_ROOT_SPAN }
+            assertEquals("cancelled", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_RESULT)])
+            assertEquals("run_retired", root.attributes[AttributeKey.stringKey(PoolTracer.ATTR_REASON)])
         } finally {
             pool.shutdown(graceful = false)
         }
@@ -345,6 +583,35 @@ class PoolWarmupTracingTest {
             }
             disabledSpan.end()
             assertTrue(spanExporter.finishedSpanItems.isNotEmpty())
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `broken trace propagation cannot fail or duplicate an HTTP request`() {
+        val brokenPropagator = mockk<TextMapPropagator>()
+        every { brokenPropagator.inject<Any>(any(), any(), any()) } throws IllegalStateException("inject boom")
+        val telemetry =
+            OpenTelemetrySdk.builder()
+                .setPropagators(ContextPropagators.create(brokenPropagator))
+                .build()
+        GlobalOpenTelemetry.set(telemetry)
+        openTelemetry = telemetry
+        val server = MockWebServer()
+        try {
+            server.enqueue(MockResponse().setResponseCode(204))
+            HttpClientProvider(
+                ConnectionConfig.builder()
+                    .domain(server.url("/").toString().removeSuffix("/"))
+                    .enableTracing()
+                    .retryPolicy(RetryPolicy.disabled())
+                    .build(),
+            ).use { provider ->
+                provider.httpClient.newCall(Request.Builder().url(server.url("/broken-propagator")).build())
+                    .execute().use { response -> assertEquals(204, response.code) }
+            }
+            assertEquals(1, server.requestCount)
         } finally {
             server.shutdown()
         }

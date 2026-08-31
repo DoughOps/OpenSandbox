@@ -59,6 +59,8 @@ class ConnectionConfig private constructor(
      * Also honored via the `OPENSANDBOX_DISABLE_METRICS=1` environment variable.
      */
     val disableMetrics: Boolean = false,
+    /** Internal staged-warmup override: suppress only the legacy sandbox.create event. */
+    internal val suppressCreateMetrics: Boolean = false,
     /**
      * Enable OpenTelemetry tracing for the client-side sandbox pool warmup path.
      *
@@ -78,6 +80,10 @@ class ConnectionConfig private constructor(
      * of this value because they cannot be safely replayed.
      */
     val retryPolicy: RetryPolicy = RetryPolicy(),
+    /** Internal override used by single-attempt operations to disable OkHttp connection recovery. */
+    internal val retryOnConnectionFailure: Boolean = true,
+    /** Internal transport mode used only by staged pool warmup health probes. */
+    internal val singleAttemptHealthChecks: Boolean = false,
 ) {
     /**
      * Creates a copy of this ConnectionConfig without copying the connectionPool.
@@ -99,8 +105,11 @@ class ConnectionConfig private constructor(
             endpointCacheSize = this.endpointCacheSize,
             endpointCacheDisabled = this.endpointCacheDisabled,
             disableMetrics = this.disableMetrics,
+            suppressCreateMetrics = this.suppressCreateMetrics,
             enableTracing = this.enableTracing,
             retryPolicy = this.retryPolicy,
+            retryOnConnectionFailure = this.retryOnConnectionFailure,
+            singleAttemptHealthChecks = this.singleAttemptHealthChecks,
         )
 
     /**
@@ -128,7 +137,67 @@ class ConnectionConfig private constructor(
             endpointCacheSize = this.endpointCacheSize,
             endpointCacheDisabled = this.endpointCacheDisabled,
             disableMetrics = this.disableMetrics,
+            suppressCreateMetrics = this.suppressCreateMetrics,
+            enableTracing = this.enableTracing,
             retryPolicy = this.retryPolicy,
+            retryOnConnectionFailure = this.retryOnConnectionFailure,
+            singleAttemptHealthChecks = this.singleAttemptHealthChecks,
+        )
+
+    /**
+     * Creates an internal transport configuration that performs exactly one HTTP attempt.
+     * Public [RetryPolicy.disabled] semantics remain unchanged and still allow OkHttp recovery.
+     */
+    internal fun copyForSingleAttempt(): ConnectionConfig =
+        ConnectionConfig(
+            apiKey = this.apiKey,
+            domain = this.domain,
+            protocol = this.protocol,
+            requestTimeout = this.requestTimeout,
+            debug = this.debug,
+            userAgent = this.userAgent,
+            headers = this.headers,
+            connectionPool = this.connectionPool,
+            connectionPoolManagedByUser = this.connectionPoolManagedByUser,
+            useServerProxy = this.useServerProxy,
+            endpointCacheTtl = this.endpointCacheTtl,
+            endpointCacheSize = this.endpointCacheSize,
+            endpointCacheDisabled = this.endpointCacheDisabled,
+            disableMetrics = this.disableMetrics,
+            suppressCreateMetrics = this.suppressCreateMetrics,
+            enableTracing = this.enableTracing,
+            retryPolicy = RetryPolicy.disabled(),
+            retryOnConnectionFailure = false,
+            singleAttemptHealthChecks = this.singleAttemptHealthChecks,
+        )
+
+    /**
+     * Derives the connection configuration used by a staged warmup Sandbox.
+     *
+     * Only health probes become single-attempt requests. Other operations retain
+     * the caller's retry policy, and the original configuration is unchanged.
+     */
+    internal fun copyForStagedWarmup(): ConnectionConfig =
+        ConnectionConfig(
+            apiKey = this.apiKey,
+            domain = this.domain,
+            protocol = this.protocol,
+            requestTimeout = this.requestTimeout,
+            debug = this.debug,
+            userAgent = this.userAgent,
+            headers = this.headers,
+            connectionPool = this.connectionPool,
+            connectionPoolManagedByUser = this.connectionPoolManagedByUser,
+            useServerProxy = this.useServerProxy,
+            endpointCacheTtl = this.endpointCacheTtl,
+            endpointCacheSize = this.endpointCacheSize,
+            endpointCacheDisabled = this.endpointCacheDisabled,
+            disableMetrics = this.disableMetrics,
+            suppressCreateMetrics = true,
+            enableTracing = this.enableTracing,
+            retryPolicy = this.retryPolicy,
+            retryOnConnectionFailure = this.retryOnConnectionFailure,
+            singleAttemptHealthChecks = true,
         )
 
     companion object {
@@ -138,7 +207,7 @@ class ConnectionConfig private constructor(
         private const val ENV_DOMAIN = "OPEN_SANDBOX_DOMAIN"
         internal const val ENV_DISABLE_METRICS = "OPENSANDBOX_DISABLE_METRICS"
 
-        private const val DEFAULT_USER_AGENT = "OpenSandbox-Kotlin-SDK/1.0.18"
+        private const val DEFAULT_USER_AGENT = "OpenSandbox-Kotlin-SDK/1.0.19"
         private const val API_VERSION = "v1"
 
         @JvmStatic
@@ -155,6 +224,9 @@ class ConnectionConfig private constructor(
         val envValue = System.getenv(ENV_DISABLE_METRICS)?.trim()
         return envValue == "1"
     }
+
+    /** Returns whether the legacy sandbox.create lifecycle event should be skipped. */
+    internal fun isCreateMetricsDisabled(): Boolean = suppressCreateMetrics || isMetricsDisabled()
 
     fun getApiKey(): String {
         return this.apiKey ?: System.getenv(ENV_API_KEY) ?: ""
@@ -435,8 +507,11 @@ class ConnectionConfig private constructor(
                 endpointCacheSize = endpointCacheSize,
                 endpointCacheDisabled = endpointCacheDisabled,
                 disableMetrics = disableMetrics,
+                suppressCreateMetrics = false,
                 enableTracing = enableTracing,
                 retryPolicy = retryPolicy,
+                retryOnConnectionFailure = true,
+                singleAttemptHealthChecks = false,
             )
         }
     }
