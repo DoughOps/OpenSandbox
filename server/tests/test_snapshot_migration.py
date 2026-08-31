@@ -15,7 +15,10 @@
 from datetime import datetime, timezone
 import json
 import os
+from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 
 import psycopg
 import pytest
@@ -42,6 +45,8 @@ def postgresql_dsn() -> str:
 
 
 def _truncate_postgresql(dsn: str) -> None:
+    repo = PostgreSQLSnapshotRepository(dsn)
+    repo.close()
     with psycopg.connect(dsn) as conn:
         conn.execute("TRUNCATE TABLE snapshots")
 
@@ -225,6 +230,7 @@ def test_migrate_dry_run_does_not_create_postgresql_schema(
     assert result.total == 1
     assert result.migrated == 1
     assert result.skipped == 0
+    assert result.dry_run is True
     with psycopg.connect(postgresql_dsn) as conn:
         row = conn.execute("SELECT to_regclass('snapshots')").fetchone()
     assert row is None or row[0] is None
@@ -322,3 +328,31 @@ def test_migrate_snapshots_cli_parser_accepts_arguments() -> None:
     assert args.sqlite_path == "/tmp/source.db"
     assert args.postgresql_dsn == "postgresql://user:pass@localhost:5432/db"
     assert args.dry_run is True
+
+
+def test_migrate_snapshots_cli_cold_start(tmp_path, postgresql_dsn: str) -> None:
+    with psycopg.connect(postgresql_dsn) as conn:
+        conn.execute("DROP TABLE IF EXISTS snapshots")
+    sqlite_repo = SQLiteSnapshotRepository(tmp_path / "opensandbox.db")
+    sqlite_repo.close()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "opensandbox_server.cli",
+            "migrate-snapshots",
+            "--from",
+            str(tmp_path / "opensandbox.db"),
+            "--to",
+            postgresql_dsn,
+        ],
+        cwd=Path(__file__).parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Snapshots migrated: total=0, migrated=0, skipped=0" in result.stdout
+    assert "partially initialized module" not in result.stdout + result.stderr

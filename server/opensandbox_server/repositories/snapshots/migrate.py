@@ -23,11 +23,6 @@ to copy the persisted snapshot catalog before restarting the server.
 The source SQLite database is opened read-only and its schema is never
 modified. Dry runs only inspect the target: the PostgreSQL schema is created
 only on a real migration run.
-
-Repository imports are deferred to call time: the ``services`` package eagerly
-imports the Docker and Kubernetes service stack, which transitively imports
-this repository package, so top-level imports here would create an import
-cycle when the CLI entry point loads.
 """
 
 from __future__ import annotations
@@ -35,17 +30,14 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from opensandbox_server.services.snapshot_models import SnapshotRecord
+from typing import Any
 
 DEFAULT_SQLITE_SNAPSHOT_PATH = Path.home() / ".opensandbox" / "opensandbox.db"
 
-# Columns stored by the snapshot repository. Older databases may predate the
-# namespace column, so each selected column is included only when present.
+_SCHEMA_LOCK_NAME = "opensandbox-server-snapshot-schema"
+
 _SNAPSHOT_TABLE_COLUMNS = (
     "id",
     "source_sandbox_id",
@@ -60,6 +52,61 @@ _SNAPSHOT_TABLE_COLUMNS = (
     "created_at",
     "updated_at",
 )
+
+_CREATE_SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS snapshots (
+        id TEXT PRIMARY KEY,
+        source_sandbox_id TEXT NOT NULL,
+        namespace TEXT DEFAULT NULL,
+        name TEXT,
+        description TEXT,
+        restore_config JSONB NOT NULL,
+        state TEXT NOT NULL,
+        reason TEXT,
+        message TEXT,
+        last_transition_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_snapshots_source_sandbox_id ON snapshots(source_sandbox_id)",
+    "CREATE INDEX IF NOT EXISTS idx_snapshots_state ON snapshots(state)",
+    "CREATE INDEX IF NOT EXISTS idx_snapshots_created_at ON snapshots(created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_snapshots_name_namespace ON snapshots(name, namespace)",
+)
+
+_INSERT_SNAPSHOT = """
+    INSERT INTO snapshots (
+        id,
+        source_sandbox_id,
+        namespace,
+        name,
+        description,
+        restore_config,
+        state,
+        reason,
+        message,
+        last_transition_at,
+        created_at,
+        updated_at
+    ) VALUES (
+        %(id)s,
+        %(source_sandbox_id)s,
+        %(namespace)s,
+        %(name)s,
+        %(description)s,
+        %(restore_config)s,
+        %(state)s,
+        %(reason)s,
+        %(message)s,
+        %(last_transition_at)s,
+        %(created_at)s,
+        %(updated_at)s
+    )
+    ON CONFLICT (id) DO NOTHING
+    RETURNING id
+"""
 
 
 @dataclass(slots=True)
@@ -105,41 +152,21 @@ def migrate_sqlite_snapshots_to_postgresql(
     records = _read_sqlite_snapshots_read_only(source_path)
     if dry_run:
         existing_ids = _read_postgresql_snapshot_ids(postgresql_dsn)
-        migrated = sum(1 for record in records if record.id not in existing_ids)
-        return SnapshotMigrationResult(
-            total=len(records),
-            migrated=migrated,
-            skipped=len(records) - migrated,
-            dry_run=True,
-        )
-
-    from opensandbox_server.repositories.snapshots.postgresql import (
-        PostgreSQLSnapshotRepository,
-    )
-
-    postgresql_repo = PostgreSQLSnapshotRepository(postgresql_dsn)
-    try:
-        existing_ids = _read_postgresql_snapshot_ids(postgresql_dsn)
-        migrated = 0
-        for record in records:
-            if record.id in existing_ids:
-                continue
-            postgresql_repo.create(record)
-            migrated += 1
-    finally:
-        postgresql_repo.close()
+        migrated = sum(1 for record in records if record["id"] not in existing_ids)
+    else:
+        migrated = _write_postgresql_snapshots(postgresql_dsn, records)
 
     return SnapshotMigrationResult(
         total=len(records),
         migrated=migrated,
         skipped=len(records) - migrated,
-        dry_run=False,
+        dry_run=dry_run,
     )
 
 
-def _read_sqlite_snapshots_read_only(db_path: Path) -> list[SnapshotRecord]:
+def _read_sqlite_snapshots_read_only(db_path: Path) -> list[dict[str, Any]]:
     """
-    Read every snapshot record without initializing or modifying the schema.
+    Read every snapshot row without initializing or modifying the schema.
 
     The database is opened with SQLite's read-only URI mode so a backup on a
     read-only mount can be migrated, and databases that predate the namespace
@@ -156,63 +183,19 @@ def _read_sqlite_snapshots_read_only(db_path: Path) -> list[SnapshotRecord]:
         rows = conn.execute(
             f"SELECT {', '.join(selected)} FROM snapshots ORDER BY created_at DESC, id DESC"
         ).fetchall()
-        records: list[SnapshotRecord] = []
+        records: list[dict[str, Any]] = []
         for row in rows:
-            values: dict[str, Any] = {column: row[column] for column in selected}
+            values = {column: row[column] for column in selected}
             for column in _SNAPSHOT_TABLE_COLUMNS:
                 values.setdefault(column, None)
-            records.append(_row_to_record(values))
+            records.append(values)
         return records
     finally:
         conn.close()
 
 
-def _row_to_record(values: dict[str, Any]) -> SnapshotRecord:
-    from opensandbox_server.services.snapshot_models import (
-        SnapshotRecord,
-        SnapshotRestoreConfig,
-        SnapshotState,
-        SnapshotStatusRecord,
-    )
-
-    restore_config = json.loads(values["restore_config"])
-    return SnapshotRecord(
-        id=values["id"],
-        source_sandbox_id=values["source_sandbox_id"],
-        namespace=values["namespace"],
-        name=values["name"],
-        description=values["description"],
-        restore_config=SnapshotRestoreConfig.from_dict(restore_config),
-        status=SnapshotStatusRecord(
-            state=SnapshotState(values["state"]),
-            reason=values["reason"],
-            message=values["message"],
-            last_transition_at=_str_to_datetime(values["last_transition_at"]),
-        ),
-        created_at=_require_datetime(values["created_at"]),
-        updated_at=_require_datetime(values["updated_at"]),
-    )
-
-
-def _str_to_datetime(value: str | None) -> datetime | None:
-    return datetime.fromisoformat(value) if value is not None else None
-
-
-def _require_datetime(value: str | None) -> datetime:
-    result = _str_to_datetime(value)
-    if result is None:
-        raise ValueError("snapshot row is missing a required timestamp")
-    return result
-
-
 def _read_postgresql_snapshot_ids(dsn: str) -> set[str]:
-    """
-    Return the ids already present in the target snapshot table.
-
-    Read-only: the schema is not created or altered here. A target without
-    the snapshot table contributes no existing ids, so a dry run against it
-    reports every source record as migratable.
-    """
+    """Return existing target ids without creating or altering the schema."""
     import psycopg
 
     with psycopg.connect(dsn) as conn:
@@ -221,6 +204,48 @@ def _read_postgresql_snapshot_ids(dsn: str) -> set[str]:
             return set()
         ids = conn.execute("SELECT id FROM snapshots").fetchall()
         return {item[0] for item in ids}
+
+
+def _write_postgresql_snapshots(dsn: str, records: list[dict[str, Any]]) -> int:
+    """Create the target schema and insert records in one transaction."""
+    import psycopg
+    from psycopg.types.json import Jsonb
+
+    migrated = 0
+    with psycopg.connect(dsn) as conn:
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            (_SCHEMA_LOCK_NAME,),
+        )
+        for statement in _CREATE_SCHEMA_STATEMENTS:
+            conn.execute(statement)
+        for record in records:
+            params = {
+                **record,
+                "restore_config": Jsonb(json.loads(record["restore_config"])),
+                "last_transition_at": _normalize_datetime(record["last_transition_at"]),
+                "created_at": _require_datetime(record["created_at"]),
+                "updated_at": _require_datetime(record["updated_at"]),
+            }
+            if conn.execute(_INSERT_SNAPSHOT, params).fetchone() is not None:
+                migrated += 1
+    return migrated
+
+
+def _normalize_datetime(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    result = datetime.fromisoformat(value)
+    if result.tzinfo is None:
+        return result.replace(tzinfo=timezone.utc)
+    return result.astimezone(timezone.utc)
+
+
+def _require_datetime(value: str | None) -> datetime:
+    result = _normalize_datetime(value)
+    if result is None:
+        raise ValueError("snapshot row is missing a required timestamp")
+    return result
 
 
 __all__ = [
