@@ -399,6 +399,21 @@ spec:
   poolRef: example-pool
 ```
 
+::: warning `Ready` does not guarantee SDK exec support
+The example above allocates warm `nginx` pods and is useful when the container's
+own service is the workload. If the lifecycle API request contains only
+`extensions.poolRef`, it does not create a `taskTemplate`. In that case,
+`Running` / `Ready` means that the pooled Pod passed its Kubernetes readiness
+checks; it does **not** mean that the OpenSandbox exec service is listening on
+port `44772`.
+
+For an interactive SDK sandbox, either make the Pool template start execd as
+part of its normal container command, or send an `entrypoint` / environment in
+the lifecycle request and configure the Pool with task-executor plus
+`/opt/opensandbox/bootstrap.sh` as described below. A plain service image such
+as `nginx` cannot serve interactive SDK calls without one of those setups.
+:::
+
 ::: info Pool capacity back-pressure
 When a lifecycle request cannot obtain a slot because the selected Pool is at
 `poolMax`, the controller records `PoolAllocationPending=True` with reason
