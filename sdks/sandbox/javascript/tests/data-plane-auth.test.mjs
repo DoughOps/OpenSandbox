@@ -55,7 +55,7 @@ function createConfig(useServerProxy, requests, includeExplicitApiKey = false) {
   return config;
 }
 
-async function sendDataPlaneRequests(useServerProxy) {
+async function sendDataPlaneRequests(useServerProxy, useEndpointApiKeys = false) {
   const requests = [];
   const connectionConfig = createConfig(
     useServerProxy,
@@ -66,12 +66,22 @@ async function sendDataPlaneRequests(useServerProxy) {
   const execd = factory.createExecdStack({
     connectionConfig,
     execdBaseUrl: "http://execd.opensandbox.test",
-    endpointHeaders: { "X-Endpoint-Token": "execd-token" },
+    endpointHeaders: {
+      "X-Endpoint-Token": "execd-token",
+      ...(useEndpointApiKeys
+        ? { "open-sandbox-api-key": "execd-secret" }
+        : {}),
+    },
   });
   const egress = factory.createEgressStack({
     connectionConfig,
     egressBaseUrl: "http://egress.opensandbox.test",
-    endpointHeaders: { "X-Endpoint-Token": "egress-token" },
+    endpointHeaders: {
+      "X-Endpoint-Token": "egress-token",
+      ...(useEndpointApiKeys
+        ? { "open-sandbox-api-key": "egress-secret" }
+        : {}),
+    },
   });
 
   await execd.health.ping();
@@ -97,6 +107,14 @@ test("server-proxied execd and egress requests retain the tenant API key", async
   for (const request of requests) {
     assert.equal(request.headers.get(API_KEY_HEADER), "tenant-secret");
   }
+});
+
+test("server-proxied requests preserve endpoint-specific API keys", async () => {
+  const requests = await sendDataPlaneRequests(true, true);
+
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].headers.get(API_KEY_HEADER), "execd-secret");
+  assert.equal(requests[1].headers.get(API_KEY_HEADER), "egress-secret");
 });
 
 test("lifecycle requests retain the tenant API key in direct mode", async () => {

@@ -62,6 +62,25 @@ public class DefaultAdapterFactoryTests
     }
 
     [Fact]
+    public void BuildDataPlaneHeaders_InServerProxyMode_ShouldPreferEndpointApiKey()
+    {
+        var config = new ConnectionConfig(new ConnectionConfigOptions
+        {
+            ApiKey = "tenant-secret",
+            UseServerProxy = true
+        });
+
+        var headers = DefaultAdapterFactory.BuildDataPlaneHeaders(
+            config,
+            new Dictionary<string, string>
+            {
+                ["open-sandbox-api-key"] = "endpoint-secret"
+            });
+
+        headers[Constants.ApiKeyHeader].Should().Be("endpoint-secret");
+    }
+
+    [Fact]
     public void SharedHttpClients_ShouldNotCarryTenantApiKeyByDefault()
     {
         var config = new ConnectionConfig(new ConnectionConfigOptions

@@ -46,8 +46,11 @@ function createDataPlaneHeaders(
     ...connectionHeaders,
     ...(endpointHeaders ?? {}),
   };
+  const endpointApiKey = Object.entries(endpointHeaders ?? {}).find(
+    ([key]) => key.toLowerCase() === API_KEY_HEADER.toLowerCase(),
+  );
 
-  if (!useServerProxy || apiKey) {
+  if (!useServerProxy || endpointApiKey || apiKey) {
     for (const key of Object.keys(headers)) {
       if (key.toLowerCase() === API_KEY_HEADER.toLowerCase()) {
         delete headers[key];
@@ -55,8 +58,12 @@ function createDataPlaneHeaders(
     }
   }
 
-  if (useServerProxy && apiKey) {
-    headers[API_KEY_HEADER] = apiKey;
+  if (useServerProxy) {
+    if (endpointApiKey) {
+      headers[endpointApiKey[0]] = endpointApiKey[1];
+    } else if (apiKey) {
+      headers[API_KEY_HEADER] = apiKey;
+    }
   }
 
   return headers;

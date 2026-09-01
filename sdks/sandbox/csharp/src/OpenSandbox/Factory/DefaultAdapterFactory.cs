@@ -139,7 +139,8 @@ public sealed class DefaultAdapterFactory : IAdapterFactory
         {
             headers.Remove(Constants.ApiKeyHeader);
         }
-        else if (connectionConfig.ApiKey is { Length: > 0 } apiKey)
+        else if (!headers.ContainsKey(Constants.ApiKeyHeader) &&
+                 connectionConfig.ApiKey is { Length: > 0 } apiKey)
         {
             headers[Constants.ApiKeyHeader] = apiKey;
         }
