@@ -21,6 +21,7 @@ import com.alibaba.opensandbox.sandbox.api.infrastructure.ClientException
 import com.alibaba.opensandbox.sandbox.api.infrastructure.ServerError
 import com.alibaba.opensandbox.sandbox.api.infrastructure.ServerException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxApiException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxBackendUnreachableException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxCapacityExceededException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxConnectionException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxError
@@ -148,6 +149,18 @@ private fun buildSandboxApiException(
 
     if (isSandboxNotFoundCode(sandboxError.code)) {
         return SandboxNotFoundException(
+            message = message,
+            statusCode = statusCode,
+            cause = cause,
+            error = sandboxError,
+            requestId = requestId,
+            responseBody = responseBody,
+            isRetryable = isRetryable,
+        )
+    }
+
+    if (sandboxError.code == SandboxError.BACKEND_CONNECTION_FAILED) {
+        return SandboxBackendUnreachableException(
             message = message,
             statusCode = statusCode,
             cause = cause,

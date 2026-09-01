@@ -18,6 +18,7 @@ package com.alibaba.opensandbox.sandbox.infrastructure.adapters.converter
 
 import com.alibaba.opensandbox.sandbox.api.execd.infrastructure.ClientError
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxApiException
+import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxBackendUnreachableException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxCapacityExceededException
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxError
 import com.alibaba.opensandbox.sandbox.domain.exceptions.SandboxNotFoundException
@@ -140,13 +141,17 @@ class SandboxErrorClassificationTest {
     fun `new exceptions should remain catchable as the existing api exception types`() {
         val notFound = SandboxNotFoundException("gone")
         val capacity = SandboxCapacityExceededException("full")
+        val backend = SandboxBackendUnreachableException("unreachable")
 
         assertInstanceOf(SandboxApiException::class.java, notFound)
         assertInstanceOf(SandboxApiException::class.java, capacity)
+        assertInstanceOf(SandboxApiException::class.java, backend)
         assertEquals(SandboxError.SANDBOX_NOT_FOUND, notFound.error.code)
         assertEquals(SandboxError.STORAGE_CAPACITY_EXCEEDED, capacity.error.code)
+        assertEquals(SandboxError.BACKEND_CONNECTION_FAILED, backend.error.code)
         assertEquals(404, notFound.statusCode)
         assertEquals(507, capacity.statusCode)
+        assertEquals(502, backend.statusCode)
     }
 
     @Test
@@ -175,5 +180,28 @@ class SandboxErrorClassificationTest {
         assertInstanceOf(SandboxCapacityExceededException::class.java, capacity)
         assertEquals("QUOTA::WORKSPACE_FULL", capacity.error.code)
         assertEquals(507, capacity.statusCode)
+    }
+
+    @Test
+    fun `backend connection failed code should surface a backend unreachable exception`() {
+        val ex =
+            errorResponse(
+                502,
+                """{"code":"BACKEND_CONNECTION_FAILED","message":"Could not connect to the backend sandbox sb-1: connection refused"}""",
+            ).toSandboxApiException { status, body -> "status=$status body=$body" }
+
+        assertInstanceOf(SandboxBackendUnreachableException::class.java, ex)
+        assertEquals(SandboxError.BACKEND_CONNECTION_FAILED, ex.error.code)
+        assertEquals(502, ex.statusCode)
+    }
+
+    @Test
+    fun `bare 502 without the backend connection code must not be classified as backend unreachable`() {
+        val ex =
+            errorResponse(502, "not a structured error body")
+                .toSandboxApiException { status, body -> "status=$status body=$body" }
+
+        assertInstanceOf(SandboxApiException::class.java, ex)
+        assertEquals(SandboxError.UNEXPECTED_RESPONSE, ex.error.code)
     }
 }
