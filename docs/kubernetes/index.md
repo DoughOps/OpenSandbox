@@ -401,11 +401,17 @@ spec:
 
 ::: warning `Ready` does not guarantee SDK exec support
 The example above allocates warm `nginx` pods and is useful when the container's
-own service is the workload. If the lifecycle API request contains only
-`extensions.poolRef`, it does not create a `taskTemplate`. In that case,
-`Running` / `Ready` means that the pooled Pod passed its Kubernetes readiness
-checks; it does **not** mean that the OpenSandbox exec service is listening on
-port `44772`.
+own service is the workload. With the default server setting
+`runtime.execd_run_as_init = false`, a lifecycle API request containing only
+`extensions.poolRef` does not create a `taskTemplate`. In that case, `Running` /
+`Ready` means that the pooled Pod passed its Kubernetes readiness checks; it
+does **not** mean that the OpenSandbox exec service is listening on port `44772`.
+
+When `runtime.execd_run_as_init = true`, the server creates a `taskTemplate`
+even for a pool-only request. That Pool must already run task-executor and
+provide an executable `/opt/opensandbox/bootstrap.sh`, just like the custom
+entrypoint and environment path described below. The plain `nginx` Pool in this
+example does not meet that task-execution contract.
 
 For an interactive SDK sandbox, either make the Pool template start execd as
 part of its normal container command, or send an `entrypoint` / environment in
