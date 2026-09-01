@@ -414,10 +414,11 @@ entrypoint and environment path described below. The plain `nginx` Pool in this
 example does not meet that task-execution contract.
 
 For an interactive SDK sandbox, either make the Pool template start execd as
-part of its normal container command, or send an `entrypoint` / environment in
-the lifecycle request and configure the Pool with task-executor plus
-`/opt/opensandbox/bootstrap.sh` as described below. A plain service image such
-as `nginx` cannot serve interactive SDK calls without one of those setups.
+part of its normal container command, or send a non-default `entrypoint` or a
+non-empty environment in the lifecycle request and configure the Pool with
+task-executor plus `/opt/opensandbox/bootstrap.sh` as described below. A plain
+service image such as `nginx` cannot serve interactive SDK calls without one of
+those setups.
 :::
 
 ::: info Pool capacity back-pressure
