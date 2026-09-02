@@ -280,6 +280,100 @@ def test_proxy_openapi_operation_ids_are_unique(client: TestClient) -> None:
     assert duplicate_warnings == []
 
 
+@pytest.mark.parametrize("prefix", ["", "/v1"])
+@pytest.mark.parametrize("suffix", ["", "/{full_path}"])
+@pytest.mark.parametrize("method", ["get", "post", "put", "delete", "patch"])
+def test_proxy_openapi_describes_transparent_responses(
+    client: TestClient,
+    prefix: str,
+    suffix: str,
+    method: str,
+) -> None:
+    app = cast(Any, client.app)
+    app.openapi_schema = None
+    schema = app.openapi()
+    path = f"{prefix}/sandboxes/{{sandbox_id}}/proxy/{{port}}{suffix}"
+    responses = schema["paths"][path][method]["responses"]
+
+    for status_code in ("default", "200"):
+        assert responses[status_code]["description"]
+        assert responses[status_code]["content"] == {"*/*": {}}
+    assert responses["422"]["content"] == {
+        "application/json": {"schema": {"$ref": "#/components/schemas/HTTPValidationError"}}
+    }
+
+
+@pytest.mark.parametrize(
+    "request_path",
+    [
+        "/sandboxes/sbx-123/proxy/44772",
+        "/sandboxes/sbx-123/proxy/44772/nested/path",
+        "/v1/sandboxes/sbx-123/proxy/44772",
+        "/v1/sandboxes/sbx-123/proxy/44772/nested/path",
+    ],
+)
+@pytest.mark.parametrize(
+    ("status_code", "content_type", "body"),
+    [
+        (200, "text/html; charset=utf-8", b"<h1>backend</h1>"),
+        (200, "text/event-stream", b"data: backend\n\n"),
+        (302, "text/plain; charset=utf-8", b"redirect"),
+        (405, "application/json", b'{"error":"backend method"}'),
+        (503, "application/octet-stream", b"\x00\xffbackend"),
+    ],
+)
+def test_proxy_preserves_backend_status_body_and_media_type(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    request_path: str,
+    status_code: int,
+    content_type: str,
+    body: bytes,
+) -> None:
+    class StubService:
+        @staticmethod
+        def get_endpoint(
+            sandbox_id: str,
+            port: int,
+            resolve_internal: bool = False,
+            use_proxy_host: bool = False,
+        ) -> Endpoint:
+            return Endpoint(endpoint="127.0.0.1:44772")
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+    fake_client = _FakeAsyncClient()
+    fake_client.response = _FakeStreamingResponse(
+        status_code=status_code,
+        headers={"content-type": content_type},
+        chunks=[body],
+    )
+    _set_http_client(client, fake_client)
+
+    response = client.get(request_path, headers=auth_headers, follow_redirects=False)
+
+    assert response.status_code == status_code
+    assert response.content == body
+    assert response.headers["content-type"] == content_type
+    assert fake_client.response.aclose_called is True
+
+
+@pytest.mark.parametrize("prefix", ["", "/v1"])
+@pytest.mark.parametrize("suffix", ["", "/nested/path"])
+def test_proxy_invalid_port_preserves_validation_error(
+    client: TestClient,
+    auth_headers: dict,
+    prefix: str,
+    suffix: str,
+) -> None:
+    response = client.get(
+        f"{prefix}/sandboxes/sbx-123/proxy/not-a-port{suffix}", headers=auth_headers
+    )
+
+    assert response.status_code == 422
+    assert response.headers["content-type"] == "application/json"
+
+
 @pytest.mark.parametrize(
     "request_path",
     [
