@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alibaba/opensandbox/nodeagent/pkg/api"
 	"github.com/alibaba/opensandbox/nodeagent/pkg/identity"
 )
 
@@ -43,9 +44,10 @@ var clusterIDPattern = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?
 type Config struct {
 	NodeName             string
 	ClusterID            string
-	Source               string
+	Sources              []string
 	Sink                 string
 	LogRoot              string
+	SyscallCgroupRoot    string
 	StateDir             string
 	StateMaxBytes        int64
 	FilePath             string
@@ -78,12 +80,14 @@ type listenAddress struct {
 }
 
 func Load() (Config, error) {
+	var errs []error
 	cfg := Config{
 		NodeName:           strings.TrimSpace(os.Getenv("NODE_NAME")),
 		ClusterID:          strings.TrimSpace(os.Getenv("NODEAGENT_CLUSTER_ID")),
-		Source:             envDefault("NODEAGENT_SOURCES", "container-logs"),
+		Sources:            parseSources(envDefault("NODEAGENT_SOURCES", api.SourceNameContainerLogs), &errs),
 		Sink:               envDefault("NODEAGENT_SINKS", SinkFile),
 		LogRoot:            envDefault("NODEAGENT_LOG_ROOT", "/var/log/pods"),
+		SyscallCgroupRoot:  envDefault("NODEAGENT_SYSCALL_CGROUP_ROOT", "/host/sys/fs/cgroup"),
 		StateDir:           envDefault("NODEAGENT_STATE_DIR", "/var/lib/opensandbox/nodeagent"),
 		FilePath:           strings.TrimSpace(os.Getenv("NODEAGENT_FILE_PATH")),
 		OSSEndpoint:        strings.TrimSpace(os.Getenv("NODEAGENT_OSS_ENDPOINT")),
@@ -97,16 +101,17 @@ func Load() (Config, error) {
 		PprofAddr:          strings.TrimSpace(os.Getenv("NODEAGENT_PPROF_ADDR")),
 	}
 
-	var errs []error
 	cfg.StateMaxBytes = parseInt64("NODEAGENT_STATE_MAX_BYTES", 1<<30, true, &errs)
 	cfg.MemoryBudgetBytes = parseInt64("NODEAGENT_MEMORY_BUDGET_BYTES", 256<<20, true, &errs)
 	cfg.PerSandboxQueueBytes = parseInt64("NODEAGENT_PER_SANDBOX_QUEUE_BYTES", 16<<20, true, &errs)
 	cfg.PerSandboxRateLimit = parseFloat("NODEAGENT_PER_SANDBOX_RATE_LIMIT", 0, false, &errs)
-	cfg.MaxLineBytes = int(parseInt64("NODEAGENT_MAX_LINE_BYTES", 1<<20, true, &errs))
-	cfg.PartialTimeout = parseDuration("NODEAGENT_PARTIAL_TIMEOUT", 5*time.Second, true, &errs)
 	cfg.SinkTimeout = parseDuration("NODEAGENT_SINK_TIMEOUT", 30*time.Second, true, &errs)
 	cfg.RetryMaxInterval = parseDuration("NODEAGENT_RETRY_MAX_INTERVAL", 30*time.Second, true, &errs)
-	cfg.EndedStateRetention = parseDuration("NODEAGENT_ENDED_STATE_RETENTION", 24*time.Hour, true, &errs)
+	if cfg.HasSource(api.SourceNameContainerLogs) {
+		cfg.MaxLineBytes = int(parseInt64("NODEAGENT_MAX_LINE_BYTES", 1<<20, true, &errs))
+		cfg.PartialTimeout = parseDuration("NODEAGENT_PARTIAL_TIMEOUT", 5*time.Second, true, &errs)
+		cfg.EndedStateRetention = parseDuration("NODEAGENT_ENDED_STATE_RETENTION", 24*time.Hour, true, &errs)
+	}
 	if cfg.Sink == SinkFile {
 		cfg.FileMaxBytes = parseInt64("NODEAGENT_FILE_MAX_BYTES", 1<<30, true, &errs)
 		cfg.FileMaxFiles = int(parseInt64("NODEAGENT_FILE_MAX_FILES", 16, true, &errs))
@@ -127,6 +132,9 @@ func Load() (Config, error) {
 
 func (c Config) validate() []error {
 	var errs []error
+	if len(c.Sources) == 0 {
+		errs = append(errs, errors.New("NODEAGENT_SOURCES must contain at least one Source"))
+	}
 	if c.NodeName == "" {
 		errs = append(errs, errors.New("NODE_NAME is required"))
 	}
@@ -136,16 +144,25 @@ func (c Config) validate() []error {
 	if c.DropPolicy != "block" && c.DropPolicy != "drop" {
 		errs = append(errs, errors.New("NODEAGENT_DROP_POLICY must be block or drop"))
 	}
-	for name, path := range map[string]string{
-		"NODEAGENT_LOG_ROOT":  c.LogRoot,
-		"NODEAGENT_STATE_DIR": c.StateDir,
-	} {
-		if err := validateAbsolutePath(path); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", name, err))
+	if err := validateAbsolutePath(c.StateDir); err != nil {
+		errs = append(errs, fmt.Errorf("NODEAGENT_STATE_DIR: %w", err))
+	}
+	containerLogsEnabled := c.HasSource(api.SourceNameContainerLogs)
+	if containerLogsEnabled {
+		if err := validateAbsolutePath(c.LogRoot); err != nil {
+			errs = append(errs, fmt.Errorf("NODEAGENT_LOG_ROOT: %w", err))
+		}
+		if pathsOverlap(c.StateDir, c.LogRoot) {
+			errs = append(errs, errors.New("NODEAGENT_STATE_DIR must not overlap NODEAGENT_LOG_ROOT"))
 		}
 	}
-	if pathsOverlap(c.StateDir, c.LogRoot) {
-		errs = append(errs, errors.New("NODEAGENT_STATE_DIR must not overlap NODEAGENT_LOG_ROOT"))
+	if c.HasSource(api.SourceNameSyscalls) {
+		if err := validateAbsolutePath(c.SyscallCgroupRoot); err != nil {
+			errs = append(errs, fmt.Errorf("NODEAGENT_SYSCALL_CGROUP_ROOT: %w", err))
+		}
+		if pathsOverlap(c.StateDir, c.SyscallCgroupRoot) {
+			errs = append(errs, errors.New("NODEAGENT_STATE_DIR must not overlap NODEAGENT_SYSCALL_CGROUP_ROOT"))
+		}
 	}
 	switch c.Sink {
 	case SinkFile:
@@ -153,8 +170,8 @@ func (c Config) validate() []error {
 			if err := validateAbsolutePath(c.FilePath); err != nil {
 				errs = append(errs, fmt.Errorf("NODEAGENT_FILE_PATH: %w", err))
 			}
-			if pathsOverlap(c.FilePath, c.StateDir) || pathsOverlap(c.FilePath, c.LogRoot) {
-				errs = append(errs, errors.New("NODEAGENT_FILE_PATH must not overlap the state or source-log root"))
+			if pathsOverlap(c.FilePath, c.StateDir) || containerLogsEnabled && pathsOverlap(c.FilePath, c.LogRoot) || c.HasSource(api.SourceNameSyscalls) && pathsOverlap(c.FilePath, c.SyscallCgroupRoot) {
+				errs = append(errs, errors.New("NODEAGENT_FILE_PATH must not overlap active state or source paths"))
 			}
 			if c.FileMaxTotalBytes < c.FileMaxBytes {
 				errs = append(errs, errors.New("NODEAGENT_FILE_MAX_TOTAL_BYTES cannot be smaller than NODEAGENT_FILE_MAX_BYTES"))
@@ -171,10 +188,12 @@ func (c Config) validate() []error {
 	if c.PerSandboxQueueBytes > c.MemoryBudgetBytes {
 		errs = append(errs, errors.New("per-sandbox queue budget cannot exceed global memory budget"))
 	}
-	if c.MaxLineBytes > 1<<30 {
-		errs = append(errs, errors.New("NODEAGENT_MAX_LINE_BYTES must not exceed 1 GiB"))
-	} else if int64(c.MaxLineBytes)+512 > c.PerSandboxQueueBytes {
-		errs = append(errs, errors.New("NODEAGENT_MAX_LINE_BYTES plus record overhead must fit the per-sandbox queue budget"))
+	if containerLogsEnabled {
+		if c.MaxLineBytes > 1<<30 {
+			errs = append(errs, errors.New("NODEAGENT_MAX_LINE_BYTES must not exceed 1 GiB"))
+		} else if int64(c.MaxLineBytes)+512 > c.PerSandboxQueueBytes {
+			errs = append(errs, errors.New("NODEAGENT_MAX_LINE_BYTES plus record overhead must fit the per-sandbox queue budget"))
+		}
 	}
 	if c.FileMaxFiles > 1<<20 {
 		errs = append(errs, errors.New("file-count limit must not exceed 1048576"))
@@ -204,6 +223,36 @@ func (c Config) validate() []error {
 		}
 	}
 	return errs
+}
+
+func parseSources(raw string, errs *[]error) []string {
+	parts := strings.Split(raw, ",")
+	sources := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			*errs = append(*errs, errors.New("NODEAGENT_SOURCES contains an empty Source name"))
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			*errs = append(*errs, fmt.Errorf("NODEAGENT_SOURCES contains duplicate Source %q", name))
+			continue
+		}
+		seen[name] = struct{}{}
+		sources = append(sources, name)
+	}
+	return sources
+}
+
+// HasSource reports whether name is enabled in the configured Source set.
+func (c Config) HasSource(name string) bool {
+	for _, source := range c.Sources {
+		if source == name {
+			return true
+		}
+	}
+	return false
 }
 
 func parseListenAddress(address string) (listenAddress, error) {

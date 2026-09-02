@@ -35,7 +35,11 @@ from opensandbox_server.config import load_config
 from opensandbox_server.integrations.renew_intent import start_renew_intent_consumer
 from opensandbox_server.logging_config import configure_logging
 from opensandbox_server.startup_guard import api_key_confirm
-from opensandbox_server.tenants import validate_tenant_config, TenantProvider
+from opensandbox_server.tenants import (
+    validate_tenant_config,
+    validate_tenant_namespaces_on_startup,
+    TenantProvider,
+)
 
 # The deployed package version, resolved at runtime from installed metadata.
 # Exposed via GET /version (not /openapi.json). Mirrors
@@ -92,7 +96,9 @@ from opensandbox_server.integrations.otel import setup_otel_metrics, shutdown_ot
 from opensandbox_server.integrations.renew_intent.proxy_renew import ProxyRenewCoordinator  # noqa: E402
 from opensandbox_server.middleware.auth import AuthMiddleware  # noqa: E402
 from opensandbox_server.middleware.date_header import DateHeaderMiddleware  # noqa: E402
+from opensandbox_server.middleware.http_metrics import HttpMetricsMiddleware  # noqa: E402
 from opensandbox_server.middleware.request_id import RequestIdMiddleware  # noqa: E402
+from opensandbox_server.repositories.snapshots.factory import close_snapshot_repository  # noqa: E402
 from opensandbox_server.services.extension_service import require_extension_service  # noqa: E402
 from opensandbox_server.services.runtime_resolver import (  # noqa: E402
     validate_secure_runtime_on_startup,
@@ -120,6 +126,20 @@ async def lifespan(app: FastAPI):
     if tenant_provider is not None:
         tenant_provider.start()
         sandbox_service.set_tenant_provider(tenant_provider)
+
+        # OSEP-0014: startup MUST validate all tenant namespaces exist and
+        # are accessible before serving traffic (fail-fast). Multi-tenancy is
+        # Kubernetes-only, which validate_tenant_config() already enforces.
+        # Providers that cannot enumerate tenants (HTTP) skip with a warning
+        # instead of silently validating an empty set.
+        try:
+            from opensandbox_server.services.k8s.client import K8sClient
+
+            core_v1_api = K8sClient(app_config.kubernetes).get_core_v1_api()
+            validate_tenant_namespaces_on_startup(tenant_provider, core_v1_api)
+        except Exception as exc:
+            logger.error("Tenant namespace validation failed: %s", exc)
+            os._exit(1)
 
     from anyio.to_thread import current_default_thread_limiter
 
@@ -177,6 +197,7 @@ async def lifespan(app: FastAPI):
         await consumer.stop()
     shutdown_otel_metrics()
     snapshot_service.close()
+    close_snapshot_repository()
     if tenant_provider is not None:
         tenant_provider.close()
     await app.state.http_client.aclose()
@@ -211,6 +232,9 @@ app.add_middleware(
 # RequestIdMiddleware wraps auth and CORS so every response (including 401 from
 # AuthMiddleware) gets X-Request-ID and logs have request_id in context.
 app.add_middleware(RequestIdMiddleware)
+# HttpMetricsMiddleware is the outermost user middleware so auth failures and
+# other early responses are included. Unmatched routes use the bounded "unknown" label.
+app.add_middleware(HttpMetricsMiddleware)
 
 # Include API routes at root and versioned prefix.
 # IMPORTANT: non-proxy routers MUST be registered before proxy_router
