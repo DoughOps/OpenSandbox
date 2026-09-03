@@ -122,6 +122,9 @@ func run() int {
 	}
 
 	ctrl := controller.InitCodeRunner()
+	commandJanitorCtx, stopCommandJanitor := context.WithCancel(context.Background())
+	defer stopCommandJanitor()
+	ctrl.StartCommandOutputJanitor(commandJanitorCtx)
 
 	// Always store probe result for capabilities endpoint.
 	controller.InitIsolatedProbe(&isolationProbe)
