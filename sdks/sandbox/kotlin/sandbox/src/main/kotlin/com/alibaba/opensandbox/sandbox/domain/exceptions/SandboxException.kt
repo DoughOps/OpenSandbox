@@ -204,6 +204,36 @@ class SandboxCapacityExceededException
         )
 
 /**
+ * Thrown when the server proxy cannot connect to the selected sandbox backend for a proxied
+ * route (server responds with HTTP 502 and the [SandboxError.BACKEND_CONNECTION_FAILED] code).
+ *
+ * The code asserts only "the proxy could not reach *this* sandbox's backend", which data-plane
+ * health probes use to decide between replacing a broken instance and backing off during
+ * shared-infrastructure incidents. A 502 whose body carries no such code stays a plain
+ * [SandboxApiException] with [SandboxError.UNEXPECTED_RESPONSE] so proxy-wide failures are not
+ * silently downgraded and remain loud.
+ */
+class SandboxBackendUnreachableException
+    @JvmOverloads
+    constructor(
+        message: String? = null,
+        cause: Throwable? = null,
+        statusCode: Int? = 502,
+        error: SandboxError = SandboxError(SandboxError.BACKEND_CONNECTION_FAILED, message),
+        requestId: String? = null,
+        responseBody: String? = null,
+        isRetryable: Boolean = false,
+    ) : SandboxApiException(
+            message = message,
+            cause = cause,
+            statusCode = statusCode,
+            error = error,
+            requestId = requestId,
+            responseBody = responseBody,
+            isRetryable = isRetryable,
+        )
+
+/**
  * Thrown when an unexpected internal error occurs within the SDK
  */
 open class SandboxInternalException(
@@ -413,6 +443,12 @@ data class SandboxError(
 
         /** The sandbox workspace is over its storage capacity (server responds with HTTP 507). */
         const val STORAGE_CAPACITY_EXCEEDED = "STORAGE_CAPACITY_EXCEEDED"
+
+        /**
+         * The server proxy could not connect to the selected sandbox backend for a proxied route
+         * (server responds with HTTP 502).
+         */
+        const val BACKEND_CONNECTION_FAILED = "BACKEND_CONNECTION_FAILED"
 
         /** Pool-specific: no idle sandbox and policy is FAIL_FAST. */
         const val POOL_EMPTY = "POOL_EMPTY"
