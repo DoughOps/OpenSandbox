@@ -50,6 +50,60 @@ func TestRunCommandRemovesForegroundOutputFiles(t *testing.T) {
 	require.False(t, status.Running)
 }
 
+func TestCommandOutputDirRejectsSymlink(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("symlink creation requires additional privileges on Windows")
+	}
+
+	tempDir := t.TempDir()
+	t.Setenv("TMPDIR", tempDir)
+	target := t.TempDir()
+	c := NewController("", "")
+	require.NoError(t, os.Symlink(target, c.commandOutputDir()))
+
+	_, err := c.combinedOutputDescriptor("test-session")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "without following symlinks")
+	require.NoFileExists(t, filepath.Join(target, "test-session.output"))
+}
+
+func TestCommandOutputDirRejectsUnsafePermissions(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("Unix permission validation does not apply on Windows")
+	}
+
+	t.Setenv("TMPDIR", t.TempDir())
+	c := NewController("", "")
+	require.NoError(t, os.Mkdir(c.commandOutputDir(), 0o777))
+	require.NoError(t, os.Chmod(c.commandOutputDir(), 0o777))
+
+	_, err := c.combinedOutputDescriptor("test-session")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unsafe permissions")
+}
+
+func TestSeekBackgroundCommandOutputRejectsSymlink(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("symlink creation requires additional privileges on Windows")
+	}
+
+	tempDir := t.TempDir()
+	target := filepath.Join(tempDir, "secret")
+	link := filepath.Join(tempDir, "command.output")
+	require.NoError(t, os.WriteFile(target, []byte("must-not-leak"), 0o600))
+	require.NoError(t, os.Symlink(target, link))
+	c := NewController("", "")
+	c.storeCommandKernel("session", &commandKernel{
+		stdoutPath:   link,
+		stderrPath:   link,
+		isBackground: true,
+	})
+
+	output, _, err := c.SeekBackgroundCommandOutput("session", 0)
+	require.Error(t, err)
+	require.Empty(t, output)
+}
+
 func TestCleanupOrphanedCommandOutputsIsScopedAndAgeBounded(t *testing.T) {
 	if goruntime.GOOS == "windows" {
 		t.Skip("TMPDIR behavior differs on Windows")

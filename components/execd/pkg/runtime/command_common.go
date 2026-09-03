@@ -18,7 +18,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -78,17 +77,18 @@ func (c *Controller) storeCommandKernel(sessionID string, kernel *commandKernel)
 // continue to work even after the /tmp directory has been removed and recreated.
 func (c *Controller) stdLogDescriptor(session string) (io.WriteCloser, io.WriteCloser, error) {
 	logDir := c.commandOutputDir()
-	if err := os.MkdirAll(logDir, 0o700); err != nil {
-		return nil, nil, fmt.Errorf("failed to create temp dir %s: %w", logDir, err)
+	if err := ensurePrivateCommandOutputDir(logDir); err != nil {
+		return nil, nil, err
 	}
 
-	stdout, err := os.OpenFile(c.stdoutFileName(session), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	stdout, err := openNewCommandOutput(c.stdoutFileName(session))
 	if err != nil {
 		return nil, nil, err
 	}
-	stderr, err := os.OpenFile(c.stderrFileName(session), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	stderr, err := openNewCommandOutput(c.stderrFileName(session))
 	if err != nil {
-		stdout.Close()
+		_ = stdout.Close()
+		removeCommandOutputFiles(c.stdoutFileName(session))
 		return nil, nil, err
 	}
 
@@ -97,10 +97,10 @@ func (c *Controller) stdLogDescriptor(session string) (io.WriteCloser, io.WriteC
 
 func (c *Controller) combinedOutputDescriptor(session string) (io.WriteCloser, error) {
 	logDir := c.commandOutputDir()
-	if err := os.MkdirAll(logDir, 0o700); err != nil {
-		return nil, fmt.Errorf("failed to create temp dir %s: %w", logDir, err)
+	if err := ensurePrivateCommandOutputDir(logDir); err != nil {
+		return nil, err
 	}
-	return os.OpenFile(c.combinedOutputFileName(session), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	return openNewCommandOutput(c.combinedOutputFileName(session))
 }
 
 func (c *Controller) commandOutputDir() string {
@@ -207,13 +207,23 @@ func (c *Controller) cleanupFinishedCommands(cutoff time.Time) {
 func (c *Controller) cleanupOrphanedCommandOutputs(now time.Time) {
 	cutoff := now.Add(-commandOutputRetention)
 	protected := c.protectedCommandOutputPaths()
-	cleanupStaleCommandOutputFiles(c.commandOutputDir(), cutoff, legacyCommandOutputPattern.MatchString, protected)
+	if err := ensurePrivateCommandOutputDir(c.commandOutputDir()); err != nil {
+		log.Warn("skip private command output cleanup: %v", err)
+	} else {
+		cleanupStaleCommandOutputFiles(c.commandOutputDir(), cutoff, legacyCommandOutputPattern.MatchString, protected)
+	}
 	cleanupStaleCommandOutputFiles(os.TempDir(), cutoff, legacyCommandOutputPattern.MatchString, nil)
 }
 
 // StartCommandOutputJanitor bounds command metadata and output retention and
 // removes legacy files that older execd versions placed directly in /tmp.
-func (c *Controller) StartCommandOutputJanitor(ctx context.Context) {
+func (c *Controller) StartCommandOutputJanitor(ctx context.Context) error {
+	// Create and validate the private directory synchronously, before init mode
+	// launches the sandbox workload. A workload may otherwise pre-create the
+	// fixed temp path and make execd follow an unsafe directory or symlink.
+	if err := ensurePrivateCommandOutputDir(c.commandOutputDir()); err != nil {
+		return err
+	}
 	safego.Go(func() {
 		c.cleanupOrphanedCommandOutputs(time.Now())
 		c.cleanupFinishedCommands(time.Now().Add(-commandOutputRetention))
@@ -229,6 +239,7 @@ func (c *Controller) StartCommandOutputJanitor(ctx context.Context) {
 			}
 		}
 	})
+	return nil
 }
 
 // readFromPos streams new content from a file starting at startPos.

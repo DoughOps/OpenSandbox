@@ -124,7 +124,10 @@ func run() int {
 	ctrl := controller.InitCodeRunner()
 	commandJanitorCtx, stopCommandJanitor := context.WithCancel(context.Background())
 	defer stopCommandJanitor()
-	ctrl.StartCommandOutputJanitor(commandJanitorCtx)
+	if err := ctrl.StartCommandOutputJanitor(commandJanitorCtx); err != nil {
+		log.Error("command output: %v", err)
+		return 1
+	}
 
 	// Always store probe result for capabilities endpoint.
 	controller.InitIsolatedProbe(&isolationProbe)
