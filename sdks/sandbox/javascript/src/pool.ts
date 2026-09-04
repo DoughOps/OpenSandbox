@@ -320,7 +320,7 @@ export class SandboxPool {
           lastError = cause;
           break;
         }
-        void this.killSandboxIds(result.discardedAliveSandboxIds);
+        void this.killSandboxIds(result.discardedAliveSandboxIds).catch(() => undefined);
         if (!result.sandboxId) break;
         attempted = true;
         let sandbox: Sandbox | undefined;
@@ -572,7 +572,9 @@ export class SandboxPool {
       const deficit = maxIdle - idleCount;
       const createCount = Math.min(deficit, this.options.warmupConcurrency);
       if (createCount <= 0) {
-        await stateStore.renewPrimaryLock(poolName, ownerId, primaryLockTtlSeconds);
+        if (!(await stateStore.renewPrimaryLock(poolName, ownerId, primaryLockTtlSeconds))) {
+          leadershipLost = true;
+        }
       } else {
         const results = await Promise.allSettled(
           Array.from({ length: createCount }, () => this.createIdleSandbox()),
@@ -710,9 +712,10 @@ export class SandboxPool {
     if (sandboxIds.length === 0) return;
     this.inFlightOperations += 1;
     try {
+      const pooledManager = this.manager;
       let manager: SandboxManager;
       try {
-        manager = this.manager ?? this.createManager();
+        manager = pooledManager ?? this.createManager();
       } catch (error) {
         this.options.logger?.warn?.("failed to create manager for pooled sandbox cleanup", { error });
         return;
@@ -726,7 +729,7 @@ export class SandboxPool {
           }
         }
       } finally {
-        if (!this.manager) await manager.close().catch(() => undefined);
+        if (!pooledManager) await manager.close().catch(() => undefined);
       }
     } finally {
       this.inFlightOperations -= 1;

@@ -189,8 +189,12 @@ test("SandboxPool warms, acquires, renews, and replenishes an idle sandbox", asy
 test("SandboxPool does not close a caller-initialized connection transport", async () => {
   const fixture = createPoolFixture();
   const suppliedConfig = fixture.connectionConfig.withTransportIfMissing();
+  const closeTransport = suppliedConfig.closeTransport.bind(suppliedConfig);
   let closeCalls = 0;
-  suppliedConfig.closeTransport = async () => { closeCalls += 1; };
+  suppliedConfig.closeTransport = async () => {
+    closeCalls += 1;
+    await closeTransport();
+  };
   const pool = SandboxPool.create({
     poolName: "transport-ownership-pool",
     maxIdle: 1,
@@ -199,11 +203,15 @@ test("SandboxPool does not close a caller-initialized connection transport", asy
     sandboxCreator: fixture.sandboxCreator,
   });
 
-  await pool.start();
-  await eventually(async () => (await pool.snapshot()).idleCount === 1);
-  await pool.shutdown();
-  assert.equal(closeCalls, 0);
-  await suppliedConfig.closeTransport();
+  try {
+    await pool.start();
+    await eventually(async () => (await pool.snapshot()).idleCount === 1);
+    await pool.shutdown();
+    assert.equal(closeCalls, 0);
+  } finally {
+    await pool.shutdown(false).catch(() => undefined);
+    await suppliedConfig.closeTransport();
+  }
 });
 
 test("SandboxPool renews primary ownership while warmup creation is in flight", async () => {
@@ -301,9 +309,11 @@ test("custom creator receives the cross-language direct-create reason", async ()
 
 test("SandboxPool resize and releaseAllIdle update observable state", async () => {
   const fixture = createPoolFixture();
+  const store = new InMemoryPoolStateStore();
   const pool = SandboxPool.create({
     poolName: "resize-pool",
     maxIdle: 1,
+    stateStore: store,
     reconcileIntervalSeconds: 60,
     connectionConfig: fixture.connectionConfig,
     creationSpec: { image: "ubuntu", adapterFactory: fixture.adapterFactory },
@@ -313,6 +323,7 @@ test("SandboxPool resize and releaseAllIdle update observable state", async () =
   await eventually(async () => (await pool.snapshot()).idleCount === 1);
   await pool.resize(2);
   await eventually(async () => (await pool.snapshot()).idleCount === 2);
+  await store.setMaxIdle("resize-pool", 0);
   assert.equal(await pool.releaseAllIdle(), 2);
   assert.equal((await pool.snapshot()).idleCount, 0);
   await pool.shutdown(false);
@@ -347,6 +358,13 @@ test("retry-next-idle skips an unhealthy sandbox without duplicating acquisition
 test("renew failure is terminal and does not consume another idle sandbox", async () => {
   const fixture = createPoolFixture({ renewFailureIds: new Set(["first"]) });
   const store = new InMemoryPoolStateStore();
+  const tryTakeIdleWithMinTtl = store.tryTakeIdleWithMinTtl.bind(store);
+  const acquiredIds = [];
+  store.tryTakeIdleWithMinTtl = async (...args) => {
+    const result = await tryTakeIdleWithMinTtl(...args);
+    acquiredIds.push(result.sandboxId);
+    return result;
+  };
   const pool = SandboxPool.create({
     poolName: "renew-pool",
     maxIdle: 0,
@@ -367,7 +385,7 @@ test("renew failure is terminal and does not consume another idle sandbox", asyn
     }),
     /renew failed/,
   );
-  assert.equal(await store.tryTakeIdle("renew-pool"), "second");
+  assert.deepEqual(acquiredIds, ["first"]);
   await pool.shutdown();
 });
 

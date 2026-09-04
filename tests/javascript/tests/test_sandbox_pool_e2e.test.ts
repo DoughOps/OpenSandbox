@@ -62,7 +62,7 @@ test("client pool warms, acquires, drains, and falls back to direct create", asy
     });
     acquired.push(warm);
     const result = await warm.commands.run("echo js-pool-ok");
-    expect(result.error).toBeNull();
+    expect(result.error).toBeUndefined();
     expect(result.logs.stdout[0]?.text).toBe("js-pool-ok");
 
     await pool.resize(0);
