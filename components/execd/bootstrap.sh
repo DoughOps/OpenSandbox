@@ -294,6 +294,7 @@ trust_mitm_ca_nss() {
 	[ -f "$cert" ] || return 0
 	[ -n "${HOME:-}" ] && [ -d "$HOME" ] || return 0
 	if ! command -v certutil >/dev/null 2>&1; then
+		echo "warning: certutil not found; Chromium/Chrome may not trust the mitm CA in NSS (install nss-tools on Alpine or libnss3-tools on Debian/Ubuntu)" >&2
 		return 0
 	fi
 	pki="${HOME}/.pki/nssdb"
