@@ -25,8 +25,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/alibaba/opensandbox/execd/pkg/log"
 	"github.com/alibaba/opensandbox/internal/safego"
+
+	"github.com/alibaba/opensandbox/execd/pkg/log"
 )
 
 const (
