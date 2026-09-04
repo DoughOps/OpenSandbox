@@ -35,27 +35,53 @@ awk '
 # shellcheck source=/dev/null
 . "$TESTDIR/trust_mitm_ca_nss.sh"
 
-set +e
-HOME="$TESTDIR/home" PATH="$TESTDIR/empty-bin" \
-  trust_mitm_ca_nss "$TESTDIR/mitm-ca.pem" 2> "$TESTDIR/stderr"
-status=$?
-set -e
+assert_missing_certutil_warns() {
+  label="$1"
+  home_mode="$2"
+  stderr="$TESTDIR/stderr-$label"
 
-if [ "$status" -ne 0 ]; then
-  echo "FAIL: missing certutil made NSS trust setup fail with status $status" >&2
-  exit 1
-fi
-if ! grep -q 'certutil not found' "$TESTDIR/stderr"; then
-  echo "FAIL: missing certutil did not emit an actionable warning" >&2
-  exit 1
-fi
-if ! grep -q 'nss-tools' "$TESTDIR/stderr"; then
-  echo "FAIL: warning did not name the Alpine nss-tools package" >&2
-  exit 1
-fi
-if ! grep -q 'libnss3-tools' "$TESTDIR/stderr"; then
-  echo "FAIL: warning did not name the Debian/Ubuntu libnss3-tools package" >&2
-  exit 1
-fi
+  set +e
+  case "$home_mode" in
+    valid)
+      HOME="$TESTDIR/home" PATH="$TESTDIR/empty-bin" \
+        trust_mitm_ca_nss "$TESTDIR/mitm-ca.pem" 2> "$stderr"
+      ;;
+    unset)
+      (unset HOME; PATH="$TESTDIR/empty-bin" \
+        trust_mitm_ca_nss "$TESTDIR/mitm-ca.pem") 2> "$stderr"
+      ;;
+    nonexistent)
+      HOME="$TESTDIR/missing-home" PATH="$TESTDIR/empty-bin" \
+        trust_mitm_ca_nss "$TESTDIR/mitm-ca.pem" 2> "$stderr"
+      ;;
+    *)
+      echo "FAIL: unknown HOME mode $home_mode" >&2
+      exit 1
+      ;;
+  esac
+  status=$?
+  set -e
+
+  if [ "$status" -ne 0 ]; then
+    echo "FAIL: $label made NSS trust setup fail with status $status" >&2
+    exit 1
+  fi
+  if ! grep -q 'certutil not found' "$stderr"; then
+    echo "FAIL: $label did not emit an actionable warning" >&2
+    exit 1
+  fi
+  if ! grep -q 'nss-tools' "$stderr"; then
+    echo "FAIL: $label did not name the Alpine nss-tools package" >&2
+    exit 1
+  fi
+  if ! grep -q 'libnss3-tools' "$stderr"; then
+    echo "FAIL: $label did not name the Debian/Ubuntu libnss3-tools package" >&2
+    exit 1
+  fi
+}
+
+assert_missing_certutil_warns 'valid HOME' valid
+assert_missing_certutil_warns 'unset HOME' unset
+assert_missing_certutil_warns 'nonexistent HOME' nonexistent
 
 echo "PASS: missing certutil warns with package guidance and remains best-effort"
