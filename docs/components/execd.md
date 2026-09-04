@@ -72,6 +72,19 @@ Bash session API (which keeps its existing name for compatibility), and
 isolated sessions. Commands submitted to a fallback session must use syntax
 supported by that image's `sh` implementation.
 
+### Command output retention
+
+Foreground command output is streamed over SSE and its temporary stdout and
+stderr files are removed as soon as streaming completes. Completed command
+metadata and detached background-command output remain available for 24 hours.
+Cleanup runs hourly after that retention window. Running commands are never
+removed by retention cleanup.
+
+The command-output janitor also removes matching files older than 24 hours that
+were left directly under the system temporary directory by earlier execd
+versions. New output is isolated under the `opensandbox-execd` temporary
+subdirectory so command files do not accumulate in the shared directory root.
+
 ## PTY WebSocket access
 
 The first WebSocket attached to `/pty/{session_id}/ws` is the exclusive
