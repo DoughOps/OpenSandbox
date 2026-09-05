@@ -1,0 +1,217 @@
+name: Publish fork images to Docker Hub
+
+on:
+  push:
+    tags:
+      # Keep the same release tag contract as the upstream image workflows.
+      - 'docker/execd/**'
+      - 'docker/code-interpreter/**'
+      - 'docker/ingress/**'
+      - 'docker/egress/**'
+      - 'docker/nodeagent/**'
+      - 'k8s/controller/**'
+      - 'k8s/task-executor/**'
+      - 'k8s/image-committer/**'
+      - 'server/v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-dockerhub-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      # Set this repository variable to a Docker Hub user or organization name.
+      # When it is not set, the login username is also used as the namespace.
+      DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+      DOCKERHUB_LOGIN_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Resolve image request
+        id: request
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          namespace="${DOCKERHUB_NAMESPACE:-${DOCKERHUB_LOGIN_USERNAME}}"
+          if [[ -z "$namespace" ]]; then
+            echo "Set DOCKERHUB_NAMESPACE or DOCKERHUB_USERNAME before publishing." >&2
+            exit 1
+          fi
+
+          case "${GITHUB_REF_NAME}" in
+            docker/*|k8s/*)
+              IFS=/ read -r release_type component image_tag remainder <<< "${GITHUB_REF_NAME}"
+              if [[ -z "$component" || -z "$image_tag" || -n "${remainder:-}" ]]; then
+                echo "Release tag must use <docker|k8s>/<component>/<tag>." >&2
+                exit 1
+              fi
+              ;;
+            server/v*)
+              component=server
+              image_tag="${GITHUB_REF_NAME#server/}"
+              release_type=server
+              ;;
+            *)
+              echo "Unsupported release tag: ${GITHUB_REF_NAME}" >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ ! "$namespace" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+            echo "Docker Hub namespace must contain only lowercase letters, numbers, _ or -." >&2
+            exit 1
+          fi
+          if [[ ! "$image_tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "Invalid Docker image tag: $image_tag" >&2
+            exit 1
+          fi
+
+          case "${release_type}/${component}" in
+            docker/execd|docker/code-interpreter|docker/ingress|docker/egress|docker/nodeagent|k8s/controller|k8s/task-executor|k8s/image-committer|server/server) ;;
+            *)
+              echo "Unsupported release tag: ${GITHUB_REF_NAME}" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "namespace=$namespace" >> "$GITHUB_OUTPUT"
+          echo "component=$component" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        shell: bash
+        env:
+          NAMESPACE: ${{ steps.request.outputs.namespace }}
+          COMPONENT: ${{ steps.request.outputs.component }}
+          IMAGE_TAG: ${{ steps.request.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+
+          version="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+          git_commit="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+          build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          platforms="linux/amd64,linux/arm64"
+
+          build_go_component() {
+            local component="$1"
+            local dockerfile="$2"
+            local image="${NAMESPACE}/opensandbox-${component}:${IMAGE_TAG}"
+
+            docker buildx build \
+              --platform "$platforms" \
+              --tag "$image" \
+              --build-arg "VERSION=$version" \
+              --build-arg "GIT_COMMIT=$git_commit" \
+              --build-arg "BUILD_TIME=$build_time" \
+              --push \
+              --file "$dockerfile" \
+              .
+          }
+
+          build_code_interpreter_base() {
+            docker buildx build \
+              --platform "$platforms" \
+              --tag "${NAMESPACE}/opensandbox-code-interpreter-base:${IMAGE_TAG}" \
+              --push \
+              --file sandboxes/code-interpreter/Dockerfile_base \
+              sandboxes/code-interpreter
+          }
+
+          build_component() {
+            local component="$1"
+            case "$component" in
+              execd|egress|ingress|nodeagent)
+                build_go_component "$component" "components/${component}/Dockerfile"
+                ;;
+              code-interpreter-base)
+                build_code_interpreter_base
+                ;;
+              code-interpreter)
+                # The application image inherits from this fork's base image.
+                build_code_interpreter_base
+                docker buildx build \
+                  --platform "$platforms" \
+                  --tag "${NAMESPACE}/opensandbox-code-interpreter:${IMAGE_TAG}" \
+                  --build-arg "BASE_IMAGE=${NAMESPACE}/opensandbox-code-interpreter-base:${IMAGE_TAG}" \
+                  --push \
+                  --file sandboxes/code-interpreter/Dockerfile \
+                  sandboxes/code-interpreter
+                ;;
+              controller)
+                docker buildx build \
+                  --platform "$platforms" \
+                  --tag "${NAMESPACE}/opensandbox-controller:${IMAGE_TAG}" \
+                  --build-arg PACKAGE=./cmd/controller \
+                  --build-arg "COMMIT_ID=$git_commit" \
+                  --build-arg "BUILD_DATE=$build_time" \
+                  --push \
+                  --file kubernetes/Dockerfile \
+                  kubernetes
+                ;;
+              task-executor)
+                docker buildx build \
+                  --platform "$platforms" \
+                  --tag "${NAMESPACE}/opensandbox-task-executor:${IMAGE_TAG}" \
+                  --build-arg PACKAGE=cmd/task-executor/main.go \
+                  --build-arg USERID=0 \
+                  --build-arg "COMMIT_ID=$git_commit" \
+                  --build-arg "BUILD_DATE=$build_time" \
+                  --push \
+                  --file kubernetes/Dockerfile \
+                  kubernetes
+                ;;
+              image-committer)
+                docker buildx build \
+                  --platform "$platforms" \
+                  --tag "${NAMESPACE}/opensandbox-image-committer:${IMAGE_TAG}" \
+                  --push \
+                  --file kubernetes/Dockerfile.image-committer \
+                  kubernetes
+                ;;
+              server)
+                build_args=()
+                if [[ "$IMAGE_TAG" =~ ^v[0-9]+(\.[0-9]+){1,2}([-.][0-9A-Za-z.-]+)?$ ]]; then
+                  build_args+=(--build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${IMAGE_TAG#v}")
+                fi
+                docker buildx build \
+                  --platform "$platforms" \
+                  --tag "${NAMESPACE}/opensandbox-server:${IMAGE_TAG}" \
+                  "${build_args[@]}" \
+                  --push \
+                  --file server/Dockerfile \
+                  server
+                ;;
+            esac
+          }
+
+          build_component "$COMPONENT"
+
+      - name: Publish summary
+        shell: bash
+        env:
+          NAMESPACE: ${{ steps.request.outputs.namespace }}
+          COMPONENT: ${{ steps.request.outputs.component }}
+          IMAGE_TAG: ${{ steps.request.outputs.image_tag }}
+        run: |
+          echo "Published \`${NAMESPACE}/opensandbox-${COMPONENT}:${IMAGE_TAG}\`." >> "$GITHUB_STEP_SUMMARY"

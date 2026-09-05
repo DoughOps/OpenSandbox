@@ -14,7 +14,8 @@
 # limitations under the License.
 
 
-FROM opensandbox/code-interpreter-base:latest
+ARG BASE_IMAGE=opensandbox/code-interpreter-base:latest
+FROM ${BASE_IMAGE}
 
 ARG TARGETARCH
 # Prebuilt binary from https://github.com/AkihiroSuda/clone3-workaround/releases/tag/v1.0.0 (amd64 only).

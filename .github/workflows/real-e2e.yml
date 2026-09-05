@@ -5,6 +5,8 @@ permissions:
   pull-requests: read
 
 on:
+  # This suite requires a Docker-capable self-hosted runner. Keep it available
+  # for forks that provide one, without queuing it for every push or PR.
   workflow_dispatch:
     inputs:
       run_code_interpreter_e2e:
@@ -12,10 +14,6 @@ on:
         required: false
         type: boolean
         default: false
-  pull_request:
-    branches: [ main ]
-  push:
-    branches: [ main ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}

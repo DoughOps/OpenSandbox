@@ -1,8 +1,8 @@
 name: Egress Tests
 
 on:
-  pull_request:
-    branches: [ main ]
+  # The smoke job requires a Docker-capable self-hosted runner.
+  workflow_dispatch:
 
 permissions:
   contents: read

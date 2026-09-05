@@ -1,8 +1,8 @@
 name: Verify License Headers
 
 on:
-  pull_request:
-    branches: [ main ]
+  # This fork does not have the self-hosted runner required by this workflow.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
